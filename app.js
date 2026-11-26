@@ -184,6 +184,9 @@ function applyRoomState(state) {
   S.users = new Map((state.connectedUsers || []).map(u => [u.id, u]));
   S.streams = state.streams || [];
   if (state.currentRoom) store.set("room:" + store.get("area", "for"), state.currentRoom.id);
+  const me = S.users.get(S.userId);
+  if (me && me.position) { M.x = me.position.x; M.y = me.position.y; showPos(); }
+  M.waiting = false;
   $("roomName").textContent = roomLabel();
   $("userCount").textContent = S.users.size;
 }
@@ -203,6 +206,12 @@ function onGikoEvent(event, args) {
     case "server-user-left-room":
       sysMsg(`${userName(args[0])} left`);
       S.users.delete(args[0]); $("userCount").textContent = S.users.size;
+      break;
+    case "server-move":
+      onServerMove(args[0]);
+      break;
+    case "server-reject-movement":
+      M.waiting = false;
       break;
     case "server-msg":
       if (args[1]) chatMsg(userName(args[0]), args[1], args[0] === S.userId);
@@ -267,8 +276,62 @@ $("chatForm").onsubmit = (e) => {
   const text = $("chatInput").value.trim();
   if (!text) return;
   emit("user-msg", text);
+  // A second, empty message clears the speech bubble over the avatar (same as
+  // pressing Enter twice in gikopoipoi). The message stays in everyone's log.
+  emit("user-msg", "");
   $("chatInput").value = "";
 };
+
+// ------------------------------------------------------------------ avatar movement
+// Like gikopoipoi's own client: while a direction is held, send one step at a
+// time, waiting for the server to confirm (server-move) or refuse
+// (server-reject-movement) before the next, plus a short pause while the
+// avatar's walk animation plays. Facing a new direction is a step that only turns.
+const M = { dir: null, waiting: false, sentAt: 0, readyAt: 0, x: null, y: null };
+const WALK_MS = 350, TURN_MS = 120;
+
+function onServerMove(dto) {
+  if (!dto) return;
+  const u = S.users.get(dto.userId);
+  if (u) u.position = { x: dto.x, y: dto.y };
+  if (dto.userId !== S.userId) return;
+  const moved = dto.x !== M.x || dto.y !== M.y;
+  M.x = dto.x; M.y = dto.y; M.waiting = false;
+  M.readyAt = Date.now() + (moved && !dto.isInstant ? WALK_MS : TURN_MS);
+  showPos();
+}
+function showPos() { $("padPos").textContent = M.x === null ? "–" : `${M.x},${M.y}`; }
+
+setInterval(() => {
+  if (!M.dir || !S.loggedIn) return;
+  const now = Date.now();
+  if (M.waiting && now - M.sentAt > 2000) M.waiting = false;   // lost reply; don't get stuck
+  if (M.waiting || now < M.readyAt) return;
+  M.waiting = true; M.sentAt = now;
+  emit("user-move", M.dir);
+}, 100);
+
+for (const b of $("pad").querySelectorAll("button")) {
+  const start = (e) => {
+    e.preventDefault();
+    try { b.setPointerCapture(e.pointerId); } catch {}
+    M.dir = b.dataset.dir; b.classList.add("held");
+  };
+  const end = () => { if (M.dir === b.dataset.dir) M.dir = null; b.classList.remove("held"); };
+  b.addEventListener("pointerdown", start);
+  b.addEventListener("pointerup", end);
+  b.addEventListener("pointercancel", end);
+  b.addEventListener("lostpointercapture", end);
+  b.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+$("padBtn").onclick = () => {
+  const show = $("pad").hidden;
+  $("pad").hidden = !show; $("padBtn").classList.toggle("on", show);
+  if (!show) M.dir = null;
+};
+
+// Keep the avatar from being marked inactive during a long stream.
+setInterval(() => { if (S.loggedIn) emit("user-ping"); }, 5 * 60 * 1000);
 
 // ------------------------------------------------------------------ rooms
 $("roomBtn").onclick = () => { $("roomsPanel").hidden = false; $("roomsList").textContent = "Loading…"; send({ t: "rooms" }); };

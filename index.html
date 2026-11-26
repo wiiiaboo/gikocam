@@ -47,6 +47,16 @@
     <button id="flip" class="icon" aria-label="Flip camera">⟲</button>
     <button id="torch" class="icon" aria-label="Torch" hidden>🔦</button>
     <button id="mute" class="icon" aria-label="Mute mic">🎤</button>
+    <button id="padBtn" class="icon" aria-label="Move avatar">🕹️</button>
+  </div>
+
+  <!-- Avatar movement pad (hold a direction to keep walking) -->
+  <div id="pad" hidden>
+    <button data-dir="up" aria-label="Up">▲</button>
+    <button data-dir="left" aria-label="Left">◀</button>
+    <span id="padPos">–</span>
+    <button data-dir="right" aria-label="Right">▶</button>
+    <button data-dir="down" aria-label="Down">▼</button>
   </div>
 
   <div id="chatFeed" aria-live="polite"></div>
