@@ -14,5 +14,5 @@ cd gikocam/deploy
 docker compose -p gikocam up -d --build
 sleep 3
 docker ps --filter name=^gikocam$ --format '{{.Names}} {{.Status}}'
-docker exec gikocam wget -qO- http://127.0.0.1:8080/health; echo
+docker exec gikocam node -e "fetch('http://127.0.0.1:8080/health').then(r=>r.text()).then(console.log)"
 rm -f /tmp/gikocam.tgz
