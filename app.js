@@ -28,6 +28,7 @@ const S = {
   micMuted: false, wakeLock: null,
   // stream
   wantLive: false, slot: null, pc: null, pendingOffer: null, streamState: "off", peerRetry: 0,
+  brb: null, // {since, reason: "pause" | "camera"} while viewers see the be-right-back screen
 };
 if (new URLSearchParams(location.search).get("relay")) store.set("relay", S.relayUrl);
 
@@ -41,6 +42,7 @@ function setStatus() {
   let text = "offline", cls = "";
   const relayUp = S.ws && S.ws.readyState === 1;
   if (!relayUp) { text = S.loggedIn ? "reconnecting…" : "offline"; cls = "warn"; }
+  else if (S.brb && S.wantLive) { text = "BRB"; cls = "brb"; }
   else if (S.streamState === "live") { text = "LIVE"; cls = "is-live"; }
   else if (S.streamState === "requesting" || S.streamState === "connecting") { text = "connecting…"; cls = "warn"; }
   else if (S.streamState === "reconnecting") { text = "stream reconnecting…"; cls = "warn"; }
@@ -49,6 +51,11 @@ function setStatus() {
   const live = $("live");
   live.textContent = S.wantLive ? "End stream" : "Go live";
   live.classList.toggle("on", S.wantLive);
+  const bb = $("brbBtn");
+  bb.hidden = !S.wantLive; $("brbSpacer").hidden = S.wantLive;
+  bb.classList.toggle("on", !!S.brb);
+  bb.textContent = S.brb ? "▶" : "☕";
+  bb.setAttribute("aria-label", S.brb ? "Back on camera" : "Be right back");
 }
 
 // ------------------------------------------------------------------ login screen
@@ -196,6 +203,7 @@ function onRelayMessage(m) {
   switch (m.t) {
     case "event": return onGikoEvent(m.event, m.args || []);
     case "rooms": return renderRooms(m.rooms);
+    case "brb-handback": return onBrbHandback(m.slot);
     case "socket":
       if (m.state === "connected") { if (S.wantLive && !S.pc) requestStream(); }
       else if (m.state === "disconnected") { sysMsg("gikopoipoi connection dropped, reconnecting…"); closePeer(); S.streamState = S.wantLive ? "reconnecting" : "off"; }
@@ -262,9 +270,16 @@ function onGikoEvent(event, args) {
       S.streams = args[0] || []; checkOwnSlot();
       break;
     case "server-ok-to-stream":
+      S.startRetry = 0;
       startPeer();
       break;
     case "server-not-ok-to-stream":
+      // Right after a stop (BRB handback) gikopoipoi can refuse a start; try again.
+      if (S.wantLive && /unknown_error/.test(String(args[0])) && (S.startRetry = (S.startRetry || 0) + 1) <= 4) {
+        const slot = S.slot; S.slot = null; S.streamState = "off";
+        setTimeout(() => requestStream(slot), 1500);
+        break;
+      }
       sysMsg("Stream refused: " + String(args[0] || "no reason given").replace(/_/g, " "));
       S.wantLive = false; S.slot = null; S.streamState = "off"; setStatus();
       break;
@@ -605,7 +620,7 @@ async function setVideoDevice(deviceId) {
     nt = (await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId) })).getVideoTracks()[0];
   }
   const sender = videoSender();
-  if (sender) await sender.replaceTrack(nt);
+  if (sender && !S.brb) await sender.replaceTrack(nt);
   if (old && old !== nt) old.stop();
   S.videoTrack = nt;
   showPreview();
@@ -616,6 +631,12 @@ function showPreview() {
   v.srcObject = new MediaStream([S.videoTrack]);
   v.classList.toggle("mirror", S.videoTrack.getSettings().facingMode === "user");
   renderZooms(); renderTorch(); renderLenses();
+  // Camera taken away (call, another app, backgrounded): viewers get the BRB screen.
+  const t = S.videoTrack;
+  const lost = () => { if (t === S.videoTrack && S.wantLive) BRB.enter("camera"); };
+  t.onmute = lost; t.onended = lost;
+  t.onunmute = () => { if (t === S.videoTrack && S.brb && S.brb.reason === "camera") BRB.exit(); };
+  if (S.brb && S.brb.reason === "camera" && t.readyState === "live" && !t.muted) BRB.exit();
 }
 
 $("flip").onclick = async () => {
@@ -725,7 +746,7 @@ function renderMics() {
 $("mic").onchange = async (e) => {
   try {
     const nt = (await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: e.target.value } } })).getAudioTracks()[0];
-    nt.enabled = !S.micMuted;
+    nt.enabled = !S.micMuted && !S.brb;
     const sender = audioSender();
     if (sender) await sender.replaceTrack(nt);
     if (S.audioTrack) S.audioTrack.stop();
@@ -734,7 +755,7 @@ $("mic").onchange = async (e) => {
 };
 $("mute").onclick = () => {
   S.micMuted = !S.micMuted;
-  if (S.audioTrack) S.audioTrack.enabled = !S.micMuted;
+  if (S.audioTrack) S.audioTrack.enabled = !S.micMuted && !S.brb;
   $("mute").classList.toggle("off", S.micMuted);
   $("mute").textContent = S.micMuted ? "🔇" : "🎤";
 };
@@ -758,15 +779,121 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// ------------------------------------------------------------------ be right back
+// Paused, or the camera is gone: the video sender is switched to a canvas that
+// fades from the camera to the BRB picture, and the mic is
+// muted. If the phone itself drops off, the relay shows the same picture
+// (server/brb-stream.js) until the phone is back.
+const BRB = (() => {
+  const imgs = {};
+  for (const o of ["landscape", "portrait"]) { const i = new Image(); i.src = `brb/${o}.webp`; imgs[o] = i; }
+  let canvas = null, ctx = null, track = null, timer = null, fade = null, orient = "landscape", alpha = 0, lastDraw = 0;
+
+  // Shape of the frames being sent. Remembered, because a camera that has
+  // just cut out may report no size at all.
+  let lastCamOrient = "landscape";
+  const camOrient = () => {
+    const v = $("preview");
+    if (v.videoWidth && v.videoHeight) lastCamOrient = v.videoHeight > v.videoWidth ? "portrait" : "landscape";
+    return lastCamOrient;
+  };
+  function drawCamera(c, W, H) {
+    const v = $("preview");
+    c.fillStyle = "#000"; c.fillRect(0, 0, W, H);
+    if (!v.videoWidth) return;
+    const s = Math.max(W / v.videoWidth, H / v.videoHeight), w = v.videoWidth * s, h = v.videoHeight * s;
+    try { c.drawImage(v, (W - w) / 2, (H - h) / 2, w, h); } catch {}
+  }
+  function frame() {
+    if (!S.brb || !ctx) return;
+    const now = performance.now();
+    let done = null;
+    if (fade) {
+      const p = Math.min(1, (now - fade.t0) / fade.ms);
+      alpha = fade.from + (fade.to - fade.from) * p;
+      if (p >= 1) { done = fade.then; fade = null; }
+    }
+    const img = imgs[orient].complete && imgs[orient].naturalWidth ? imgs[orient] : null;
+    // While fading, every frame; after that the picture is static, but keep
+    // redraw it once a second so the stream keeps sending frames.
+    if (fade || done || alpha < 1 || now - lastDraw > 1000) {
+      lastDraw = now;
+      gikocamBrb.draw(ctx, orient, img, alpha, alpha < 1 ? drawCamera : null);
+    }
+    if (done) done();
+  }
+  async function enter(reason) {
+    if (S.brb) {
+      if (reason === "pause") S.brb.reason = "pause";
+      if (S.brb.leaving) { S.brb.leaving = false; fade = { from: alpha, to: 1, t0: performance.now(), ms: 400 }; }
+      return setStatus();
+    }
+    S.brb = { since: Date.now(), reason };
+    orient = camOrient();
+    const [W, H] = gikocamBrb.SIZES[orient];
+    canvas = document.createElement("canvas"); canvas.width = W; canvas.height = H;
+    ctx = canvas.getContext("2d");
+    alpha = 0; drawn = false; fade = { from: 0, to: 1, t0: performance.now(), ms: 1000 };
+    frame();
+    track = canvas.captureStream(15).getVideoTracks()[0];
+    timer = setInterval(frame, 66);
+    if (S.audioTrack) S.audioTrack.enabled = false;
+    const snd = videoSender();
+    if (snd) await snd.replaceTrack(track).catch(() => {});
+    setStatus();
+  }
+  function exit() {
+    if (!S.brb || S.brb.leaving) return;
+    const cam = S.videoTrack;
+    if (!cam || cam.readyState !== "live" || cam.muted) { toast("The camera isn't back yet"); S.brb.reason = "camera"; return setStatus(); }
+    S.brb.leaving = true;
+    fade = { from: alpha, to: 0, t0: performance.now(), ms: 700, then: finish };
+  }
+  async function finish() {
+    if (!S.brb || !S.brb.leaving) return;
+    const snd = videoSender();
+    if (snd && S.videoTrack) await snd.replaceTrack(S.videoTrack).catch(() => {});
+    stop();
+  }
+  function stop() {
+    clearInterval(timer); timer = null;
+    if (track) track.stop();
+    canvas = ctx = track = null; fade = null;
+    if (!S.brb) return;
+    S.brb = null;
+    if (S.audioTrack) S.audioTrack.enabled = !S.micMuted;
+    setStatus();
+  }
+  return { enter, exit, stop, track: () => (S.brb && track) || null, orient: () => (S.brb ? orient : camOrient()) };
+})();
+
+$("brbBtn").onclick = () => { if (S.brb) BRB.exit(); else BRB.enter("pause"); };
+
+// Heartbeat: lets the relay notice within seconds when the phone drops off
+// while live, and cover for it with the BRB stream.
+setInterval(() => {
+  if (!S.loggedIn) return;
+  send({ t: "hb", live: S.wantLive && S.slot !== null, orient: BRB.orient() });
+}, 2000);
+
+function onBrbHandback(slot) {
+  // The relay was showing the BRB stream in our slot and has just stopped it;
+  // request the same slot again.
+  if (!S.wantLive || S.streamState === "requesting") return;
+  sysMsg("Reconnected: back on air");
+  closePeer(); S.peerRetry = 0; S.slot = null;
+  requestStream(Number.isInteger(slot) ? slot : null);
+}
+
 // ------------------------------------------------------------------ streaming
 $("live").onclick = () => {
   if (S.wantLive) stopStream(); else { S.wantLive = true; requestStream(); }
   setStatus();
 };
 
-function requestStream() {
+function requestStream(preferSlot = null) {
   if (!S.wantLive || S.pc || S.streamState === "requesting") return;
-  const slot = S.streams.findIndex(s => !s.isActive);
+  const slot = Number.isInteger(preferSlot) ? preferSlot : S.streams.findIndex(s => !s.isActive);
   if (slot < 0) {
     toast(S.streams.length ? "Every stream slot in this room is taken" : "This room has no stream slots. Pick another room.", 4000);
     S.wantLive = false; setStatus();
@@ -811,7 +938,7 @@ function startPeer() {
       setTimeout(() => { if (S.pc === pc && pc.iceConnectionState === "disconnected") restartPeer(); }, 6000);
     } else if (st === "failed") restartPeer();
   });
-  const ms = new MediaStream([S.videoTrack, S.audioTrack].filter(Boolean));
+  const ms = new MediaStream([BRB.track() || S.videoTrack, S.audioTrack].filter(Boolean));
   for (const t of ms.getTracks()) pc.addTrack(t, ms);
   setStatus();
 }
@@ -851,6 +978,7 @@ function closePeer(resetState = true) {
 
 function stopStream() {
   S.wantLive = false;
+  BRB.stop();
   emit("user-want-to-stop-stream");
   closePeer(); S.slot = null;
   setStatus();

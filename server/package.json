@@ -8,6 +8,8 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "1.2.1",
+    "@roamhq/wrtc": "0.10.0",
     "socket.io-client": "4.8.3",
     "ws": "8.18.3"
   },

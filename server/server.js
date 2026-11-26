@@ -15,6 +15,8 @@
 //   -> {t:"emit", event, args:[...]}                   allow-listed socket.io emits
 //   <- {t:"event", event, args:[...]}                  every socket.io event from gikopoipoi
 //   -> {t:"rooms"}            <- {t:"rooms", rooms}
+//   -> {t:"hb", live, orient}                           phone heartbeat, every 2 s
+//   <- {t:"brb-handback", slot}  the relay was showing the BRB stream; request the slot again
 //   -> {t:"logout"}
 //   <- {t:"socket", state}    "connected" | "disconnected" | "rejected"
 //   <- {t:"error", message}
@@ -25,6 +27,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer } from "ws";
 import { io } from "socket.io-client";
+import { fileURLToPath } from "node:url";
+import { BrbStream } from "./brb-stream.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const GIKO = (process.env.GIKO_BASE_URL || "https://gikopoipoi.net").replace(/\/$/, "");
@@ -33,12 +37,18 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   .split(",").map(s => s.trim()).filter(Boolean);
 const RESUME_GRACE_MS = Number(process.env.RESUME_GRACE_MS || 90_000);
 const MAX_MISSED_EVENTS = 300;
+// A live phone that sends no heartbeat for this long is replaced by the BRB stream.
+const PHONE_SILENT_MS = Number(process.env.PHONE_SILENT_MS || 6_000);
+// How long the BRB stream (and the gikopoipoi user) waits for the phone to come back.
+const BRB_GRACE_MS = Number(process.env.BRB_GRACE_MS || 30 * 60_000);
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 10);
 // When set, the relay also serves the phone page from this folder (VPS setup).
 const STATIC_DIR = process.env.STATIC_DIR ? path.resolve(process.env.STATIC_DIR) : null;
+// brb.js and brb/*.webp: next to the page in Docker, the repo root locally.
+const PAGE_DIR = STATIC_DIR || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-  ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json",
+  ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp", ".ico": "image/x-icon", ".json": "application/json",
 };
 
 async function serveStatic(pathname, res) {
@@ -118,6 +128,11 @@ class Session {
     this.room = null;
     this.missed = [];
     this.expiryTimer = null;
+    this.slot = null;                // stream slot the phone asked for
+    this.phone = { live: false, lastHb: 0, orient: "landscape" };
+    this.brb = null;                 // BrbStream while the relay covers for the phone
+    this.streams = [];               // latest stream slots of the current room
+    this.slotWaiters = [];
   }
 
   send(msg) {
@@ -163,7 +178,21 @@ class Session {
       socket.disconnect();
     });
     socket.on("server-update-current-room-state", (state) => { this.room = state; });
-    socket.onAny((event, ...args) => this.send({ t: "event", event, args }));
+    socket.onAny((event, ...args) => {
+      if (event === "server-update-current-room-streams") {
+        this.streams = args[0] || [];
+        this.slotWaiters = this.slotWaiters.filter((w) => !w());
+      }
+      if (this.brb) {
+        // While the relay streams the BRB screen, stream signalling is ours,
+        // not the phone's. The phone re-requests its slot on handback.
+        if (event === "server-rtc-message" && args[0] === this.brb.slot) return this.brb.onRtc(args[1], args[2]);
+        if (event === "server-ok-to-stream") return this.brb.connect();
+        if (event === "server-not-ok-to-stream") { log("brb_refused", { reason: args[0] }); this.endBrb(); return; }
+        if (event === "server-update-current-room-streams") return;
+      }
+      this.send({ t: "event", event, args });
+    });
   }
 
   async rooms() {
@@ -171,6 +200,82 @@ class Session {
       { headers: { authorization: `Bearer ${this.privateUserId}` } });
     if (Array.isArray(rooms)) roomCache.set(this.areaId, { at: Date.now(), rooms });
     return rooms;
+  }
+
+  /** Phone -> gikopoipoi emit, watched for stream state. */
+  emitFromPhone(event, args) {
+    if (event === "user-want-to-stream") { this.handBack("phone restarted"); this.slot = args[0]?.streamSlotId ?? null; }
+    else if (event === "user-want-to-stop-stream") { this.handBack("phone stopped"); this.slot = null; this.phone.live = false; }
+    else if (event === "user-rtc-message" && this.brb) {
+      // The phone woke up and re-offered on the slot the relay now holds:
+      // hand the slot back and let it request a fresh stream.
+      this.handBack("phone re-offered");
+      return;
+    }
+    this.socket.emit(event, ...args);
+  }
+
+  heartbeat(m) {
+    this.phone.lastHb = Date.now();
+    this.phone.live = !!m.live;
+    this.phone.orient = m.orient === "portrait" ? "portrait" : "landscape";
+    this.handBack("phone back");
+  }
+
+  /** Called every second: cover for a live phone that went quiet. */
+  watch() {
+    if (this.brb || !this.phone.live || this.slot === null || !this.socket?.connected) return;
+    if (Date.now() - this.phone.lastHb < PHONE_SILENT_MS) return;
+    this.brb = new BrbStream({
+      pageDir: PAGE_DIR, slot: this.slot, orient: this.phone.orient,
+      emit: (e, ...a) => this.socket?.connected && this.socket.emit(e, ...a),
+      log: (e, d) => log(e, d),
+    });
+    const brb = this.brb, slot = this.slot;
+    log("brb_started", { slot, orient: this.phone.orient });
+    brb.start().catch((e) => { log("brb_failed", { message: String(e.message || e) }); this.endBrb(); });
+    // End the phone's stream and start ours in the same slot. Viewers only
+    // switch to a new picture when the stream stops and starts again (their
+    // "auto resume" setting, on by default, picks it back up). gikopoipoi
+    // refuses a start until the stop has gone through, so wait for it.
+    this.socket.emit("user-want-to-stop-stream");
+    this.waitSlotFree(slot).then(() => {
+      if (this.brb !== brb || !this.socket?.connected) return;
+      this.socket.emit("user-want-to-stream", {
+        streamSlotId: slot, withVideo: true, withSound: false, isVisibleOnlyToSpecificUsers: false,
+        streamIsVtuberMode: false, isNicoNicoMode: false, info: [],
+      });
+    });
+    // Give the phone longer to come back while viewers see the BRB screen.
+    if (!this.ws) { clearTimeout(this.expiryTimer); this.expiryTimer = setTimeout(() => this.destroy("brb_timeout"), BRB_GRACE_MS); }
+  }
+
+  endBrb() {
+    if (!this.brb) return false;
+    this.brb.stop(); this.brb = null;
+    return true;
+  }
+
+  /** Resolves once gikopoipoi reports `slot` free (or after `ms`). */
+  waitSlotFree(slot, ms = 4000) {
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); setTimeout(resolve, 1000); return true; }; // media server needs a moment more
+      const timer = setTimeout(() => { this.slotWaiters = this.slotWaiters.filter((w) => w !== check); resolve(); }, ms);
+      const check = () => (!this.streams[slot] || !this.streams[slot].isActive ? done() : false);
+      this.slotWaiters.push(check);
+    });
+  }
+
+  /** Stop the relay's BRB stream and tell the phone to take its slot back. */
+  handBack(reason) {
+    if (!this.brb) return false;
+    const slot = this.brb.slot;
+    this.endBrb();
+    log("brb_stopped", { reason });
+    if (!this.socket?.connected) { this.send({ t: "brb-handback", slot }); return true; }
+    this.socket.emit("user-want-to-stop-stream");
+    this.waitSlotFree(slot).then(() => this.send({ t: "brb-handback", slot }));
+    return true;
   }
 
   attach(ws) {
@@ -185,11 +290,13 @@ class Session {
     this.ws = null;
     // Keep the gikopoipoi user (and so the stream slot) alive while the phone
     // reconnects; mobile data drops are normal.
-    this.expiryTimer = setTimeout(() => this.destroy("resume_timeout"), RESUME_GRACE_MS);
+    const grace = this.phone.live || this.brb ? BRB_GRACE_MS : RESUME_GRACE_MS;
+    this.expiryTimer = setTimeout(() => this.destroy(this.brb ? "brb_timeout" : "resume_timeout"), grace);
   }
 
   destroy(reason) {
     clearTimeout(this.expiryTimer);
+    this.endBrb();
     sessions.delete(this.key);
     if (this.socket) {
       if (this.socket.connected) this.socket.emit("user-want-to-stop-stream");
@@ -394,13 +501,19 @@ wss.on("connection", (ws, req) => {
           session = s;
           s.attach(ws);
           const missed = s.missed; s.missed = [];
+          s.phone.lastHb = Date.now();
           reply({ t: "resumed", userId: s.userId, room: s.room, socketConnected: !!s.socket?.connected, missed });
+          s.handBack("phone back");
           return;
         }
         case "emit": {
           if (!session) return reply({ t: "error", message: "not logged in" });
           if (!ALLOWED_EMITS.has(msg.event)) return reply({ t: "error", message: "event not allowed: " + msg.event });
-          session.socket.emit(msg.event, ...(Array.isArray(msg.args) ? msg.args : []));
+          session.emitFromPhone(msg.event, Array.isArray(msg.args) ? msg.args : []);
+          return;
+        }
+        case "hb": {
+          if (session) session.heartbeat(msg);
           return;
         }
         case "rooms": {
@@ -423,6 +536,8 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => { if (session) session.detach(ws); });
 });
+
+setInterval(() => { for (const s of sessions.values()) s.watch(); }, 1000);
 
 // Detect phones that vanished without closing (common on mobile data).
 setInterval(() => {

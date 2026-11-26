@@ -74,6 +74,8 @@ button { cursor: pointer; }
   padding: 0 calc(12px + var(--sa-r)) calc(14px + var(--sa-b)) calc(12px + var(--sa-l)); }
 #bottom .row { display: flex; align-items: center; justify-content: space-between; }
 .icon-spacer { width: 44px; }
+#brbBtn.on { background: #ffd60a; color: #000; border-color: #ffd60a; }
+.status.brb { background: #ffd60a; color: #000; border-color: transparent; font-weight: 700; }
 #zooms { display: flex; justify-content: center; gap: 6px; margin-bottom: 12px; }
 #zooms button { min-width: 42px; height: 34px; border-radius: 999px; border: 1px solid var(--line);
   background: var(--glass); font-size: 13px; padding: 0 8px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
