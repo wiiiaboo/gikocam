@@ -42,6 +42,7 @@
   <div id="stats"></div>
   <div id="log"></div>
   <div class="panel" id="panel" hidden>
+    <div class="row" id="zooms"></div>
     <div class="row" id="lenses"></div>
     <div class="row">
       <select id="mic"></select>
@@ -90,6 +91,7 @@ $('start').onclick = async () => {
     $('local').srcObject = new MediaStream([videoTrack]);
     await setupLoopback();
     await refreshDevices();
+    renderZooms();
     $('panel').hidden = false;
     setInterval(updateStats, 1000);
   } catch (e) { log('START FAILED', e.name + ': ' + e.message); $('start').hidden = false; }
@@ -127,6 +129,65 @@ function renderLenses() {
   }
 }
 $('showVirtual').onchange = renderLenses;
+
+// ---- Zoom (pinch + presets) and torch -------------------------------------
+function zoomCaps() {
+  const c = videoTrack && videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
+  return c.zoom ? c.zoom : null;
+}
+let zoomBusy = false, zoomPending = null;
+async function setZoom(z, source) {
+  const caps = zoomCaps(); if (!caps) return;
+  z = Math.min(caps.max, Math.max(caps.min, z));
+  if (zoomBusy) { zoomPending = [z, source]; return; }   // keep only the latest request
+  zoomBusy = true;
+  const t0 = performance.now();
+  try {
+    await videoTrack.applyConstraints({ advanced: [{ zoom: z }] });
+    if (source !== 'pinch') log(`zoom -> ${z.toFixed(2)}x (${source}) in ${(performance.now() - t0) | 0}ms, settings.zoom=${videoTrack.getSettings().zoom}`);
+  } catch (e) { log('zoom FAILED', e.name + ': ' + e.message); }
+  zoomBusy = false;
+  if (zoomPending) { const [pz, ps] = zoomPending; zoomPending = null; setZoom(pz, ps); }
+}
+function renderZooms() {
+  const box = $('zooms'); box.innerHTML = '';
+  const caps = zoomCaps();
+  if (!caps) { box.textContent = 'no zoom on this camera'; return; }
+  for (const z of [0.5, 1, 2, 3, 5, 10].filter(z => z >= caps.min && z <= caps.max)) {
+    const b = document.createElement('button'); b.textContent = z + '×';
+    b.onclick = () => setZoom(z, 'button'); box.appendChild(b);
+  }
+  const t = document.createElement('button'); t.textContent = 'Torch';
+  t.onclick = async () => {
+    const on = !videoTrack.getSettings().torch;
+    try { await videoTrack.applyConstraints({ advanced: [{ torch: on }] }); log('torch', on); t.classList.toggle('active', on); }
+    catch (e) { log('torch FAILED', e.name + ': ' + e.message); }
+  };
+  if (videoTrack.getCapabilities().torch) box.appendChild(t);
+}
+
+// Pinch anywhere on the video. Logs one summary line per gesture.
+let pinch = null;
+const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+$('stage').addEventListener('touchstart', e => {
+  if (e.touches.length === 2 && zoomCaps()) {
+    pinch = { d0: dist(e.touches), z0: videoTrack.getSettings().zoom || 1, t0: performance.now(), n: 0 };
+    e.preventDefault();
+  }
+}, { passive: false });
+$('stage').addEventListener('touchmove', e => {
+  if (pinch && e.touches.length === 2) {
+    e.preventDefault(); pinch.n++;
+    setZoom(pinch.z0 * dist(e.touches) / pinch.d0, 'pinch');
+  }
+}, { passive: false });
+$('stage').addEventListener('touchend', e => {
+  if (pinch && e.touches.length < 2) {
+    log(`pinch ${pinch.z0.toFixed(2)}x -> ${(+videoTrack.getSettings().zoom).toFixed(2)}x, ${pinch.n} moves, ${(performance.now() - pinch.t0) | 0}ms`);
+    pinch = null;
+  }
+});
+document.addEventListener('gesturestart', e => e.preventDefault()); // stop iOS page zoom
 
 // Loopback: pcA (phone -> "media server") and pcB (stands in for the server/viewer)
 // in the same page. Proves replaceTrack swaps the lens without renegotiating.
@@ -171,7 +232,7 @@ async function switchCamera(deviceId, label) {
     describeTrack('new video', nt);
     if (audioTrack && audioTrack.readyState === 'ended') log('!! audio track ended during camera switch');
   } catch (e) { log('switch FAILED', label, e.name + ': ' + e.message); }
-  switching = false; renderLenses();
+  switching = false; renderLenses(); renderZooms();
 }
 
 function nextRemoteFrame() {
@@ -206,7 +267,7 @@ $('quality').onchange = applyBitrate;
 let lastBytes = 0, lastTs = 0;
 async function updateStats() {
   if (!pcA) return;
-  const stats = await pcA.getStats(vSender.track ? vSender : null);
+  const stats = await vSender.getStats();
   let out = '';
   stats.forEach(r => {
     if (r.type === 'outbound-rtp' && r.kind === 'video') {
@@ -218,13 +279,15 @@ async function updateStats() {
   });
   const s = videoTrack ? videoTrack.getSettings() : {};
   $('stats').textContent = out + `\ncam ${s.width}x${s.height}\n${videoTrack ? videoTrack.label : ''}` +
+    (s.zoom !== undefined ? `\nzoom ${(+s.zoom).toFixed(2)}x` : '') +
     `\nwake: ${wakeLock ? 'on' : 'off'}`;
 }
 
 $('wake').onclick = async () => {
   try {
     if (wakeLock) { await wakeLock.release(); wakeLock = null; }
-    else if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.onrelease = () => log('wake lock released by system'); }
+    else if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); log('wake lock acquired');
+      wakeLock.onrelease = () => { log('wake lock released'); wakeLock = null; $('wake').textContent = 'Wake lock: off'; }; }
     else log('Wake Lock API not supported');
   } catch (e) { log('wake lock FAILED', e.name + ': ' + e.message); }
   $('wake').textContent = 'Wake lock: ' + (wakeLock ? 'on' : 'off');
