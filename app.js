@@ -187,6 +187,7 @@ function applyRoomState(state) {
   const me = S.users.get(S.userId);
   if (me && me.position) { M.x = me.position.x; M.y = me.position.y; showPos(); }
   M.waiting = false;
+  RV.onRoom();
   $("roomName").textContent = roomLabel();
   $("userCount").textContent = S.users.size;
 }
@@ -200,13 +201,23 @@ function onGikoEvent(event, args) {
       checkOwnSlot();
       break;
     case "server-user-joined-room":
-      S.users.set(args[0].id, args[0]); $("userCount").textContent = S.users.size;
+      S.users.set(args[0].id, args[0]); $("userCount").textContent = S.users.size; RV.requestDraw();
       sysMsg(`${args[0].name || "Anonymous"} joined`);
       break;
     case "server-user-left-room":
-      sysMsg(`${userName(args[0])} left`);
-      S.users.delete(args[0]); $("userCount").textContent = S.users.size;
+      if (args[0] !== S.userId) sysMsg(`${userName(args[0])} left`);
+      S.users.delete(args[0]); $("userCount").textContent = S.users.size; RV.requestDraw();
       break;
+    case "server-character-changed": {
+      const u = S.users.get(args[0]);
+      if (u) { u.characterId = args[1]; RV.requestDraw(); }
+      break;
+    }
+    case "server-user-inactive": case "server-user-active": {
+      const u = S.users.get(args[0]);
+      if (u) { u.isInactive = event === "server-user-inactive"; RV.requestDraw(); }
+      break;
+    }
     case "server-move":
       onServerMove(args[0]);
       break;
@@ -293,12 +304,29 @@ const WALK_MS = 350, TURN_MS = 120;
 function onServerMove(dto) {
   if (!dto) return;
   const u = S.users.get(dto.userId);
-  if (u) u.position = { x: dto.x, y: dto.y };
+  if (u) {
+    RV.startWalk(u, dto);
+    u.position = { x: dto.x, y: dto.y }; u.direction = dto.direction; u.isInactive = false;
+  }
+  RV.requestDraw();
   if (dto.userId !== S.userId) return;
   const moved = dto.x !== M.x || dto.y !== M.y;
   M.x = dto.x; M.y = dto.y; M.waiting = false;
   M.readyAt = Date.now() + (moved && !dto.isInstant ? WALK_MS : TURN_MS);
   showPos();
+  if (moved && !dto.isInstant) enterDoorIfOnOne();
+}
+
+// Stepping onto a door square takes you to the room behind it, as in gikopoipoi.
+let doorRequested = false;
+function enterDoorIfOnOne() {
+  const room = S.room && S.room.currentRoom;
+  if (!room || !room.doors || doorRequested) return;
+  const door = Object.values(room.doors).find(d => d.target && d.x === M.x && d.y === M.y);
+  if (!door) return;
+  doorRequested = true; M.dir = null;
+  if (S.wantLive) toast("Your stream will restart in the new room");
+  emit("user-change-room", { targetRoomId: door.target.roomId, targetDoorId: door.target.doorId });
 }
 function showPos() { $("padPos").textContent = M.x === null ? "–" : `${M.x},${M.y}`; }
 
@@ -327,8 +355,153 @@ for (const b of $("pad").querySelectorAll("button")) {
 $("padBtn").onclick = () => {
   const show = $("pad").hidden;
   $("pad").hidden = !show; $("padBtn").classList.toggle("on", show);
+  $("roomView").hidden = !show; $("cam").classList.toggle("moving", show);
+  if (show) RV.show();
   if (!show) M.dir = null;
 };
+
+// ------------------------------------------------------------------ room view
+// A small live picture of the room, drawn the way gikopoipoi's client does it:
+// background image, then room objects and avatars back-to-front, positioned
+// with the room's isometric grid. The view follows your own avatar.
+const RV = (() => {
+  const canvas = $("roomCanvas"), ctx = canvas.getContext("2d");
+  const images = new Map();   // url -> HTMLImageElement (loaded or loading)
+  const walks = new Map();    // userId -> {fx, fy, t0} smoothing for steps
+  let drawQueued = false, animating = false, roomId = null;
+  const STEP_MS = 330, CHAR_SCALE = 0.5;
+
+  function img(url, fallback) {
+    let im = images.get(url);
+    if (!im) {
+      im = new Image();
+      im.onload = requestDraw;
+      if (fallback) im.onerror = () => { if (im.src !== fallback) im.src = fallback; };
+      im.src = url;
+      images.set(url, im);
+    }
+    return im.complete && im.naturalWidth ? im : null;
+  }
+  const room = () => S.room && S.room.currentRoom;
+  const visible = () => !$("roomView").hidden && !$("cam").hidden;
+
+  function real(r, x, y) {   // calculateRealCoordinates from gikopoipoi
+    const bw = r.blockWidth || 80, bh = r.blockHeight || 40;
+    return { x: r.originCoordinates.x + x * bw / 2 + y * bw / 2, y: r.originCoordinates.y + x * bh / 2 - y * bh / 2 };
+  }
+  function userPhys(r, u, now) {
+    const to = real(r, u.position.x, u.position.y);
+    const w = walks.get(u.id);
+    if (!w) return to;
+    const t = Math.min(1, (now - w.t0) / STEP_MS);
+    if (t >= 1) { walks.delete(u.id); return to; }
+    return { x: w.fx + (to.x - w.fx) * t, y: w.fy + (to.y - w.fy) * t };
+  }
+  function startWalk(u, dto) {
+    const r = room();
+    if (!r || !u.position || dto.isInstant || (u.position.x === dto.x && u.position.y === dto.y)) return;
+    const from = userPhys(r, u, performance.now());
+    walks.set(u.id, { fx: from.x, fy: from.y, t0: performance.now() });
+  }
+
+  function requestDraw() {
+    if (drawQueued || !visible()) return;
+    drawQueued = true;
+    requestAnimationFrame(() => { drawQueued = false; draw(); });
+  }
+
+  function draw() {
+    const r = room();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+      canvas.width = Math.round(cw * dpr); canvas.height = Math.round(ch * dpr);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = (r && r.backgroundColor) || "#1b1b1f";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (!r) return;
+    const roomScale = r.scale || 1, bw = r.blockWidth || 80;
+    const bg = img(`${GIKO}/${r.backgroundImageUrl}`);
+    const worldW = bg ? bg.naturalWidth * roomScale : 1200, worldH = bg ? bg.naturalHeight * roomScale : 800;
+    const now = performance.now();
+
+    // Zoom so a decent chunk of the room is visible, then centre on our avatar.
+    const scale = Math.max(cw / worldW, 0.6) * dpr;
+    const me = S.users.get(S.userId);
+    const mp = me && me.position ? userPhys(r, me, now) : { x: worldW / 2, y: worldH / 2 };
+    let camX = mp.x + bw / 2 - canvas.width / scale / 2, camY = mp.y - 60 - canvas.height / scale / 2;
+    camX = Math.max(Math.min(camX, worldW - canvas.width / scale), Math.min(0, worldW - canvas.width / scale));
+    camY = Math.max(Math.min(camY, worldH - canvas.height / scale), Math.min(0, worldH - canvas.height / scale));
+    if (worldW * scale < canvas.width) camX = -(canvas.width / scale - worldW) / 2;
+    if (worldH * scale < canvas.height) camY = -(canvas.height / scale - worldH) / 2;
+    ctx.setTransform(scale, 0, 0, scale, -camX * scale, -camY * scale);
+
+    if (bg) ctx.drawImage(bg, 0, 0, worldW, worldH);
+
+    // Back-to-front, using gikopoipoi's priority order (objects before avatars on ties).
+    const sy = r.size ? r.size.y : 0;
+    const items = [];
+    for (const o of r.objects || []) {
+      if (o.isHidden) continue;
+      items.push({ p: o.x + 1 + (sy - o.y), k: 0, o });
+    }
+    for (const u of S.users.values()) if (u.position) items.push({ p: u.position.x + 1 + (sy - u.position.y), k: 1, u });
+    items.sort((a, b) => a.p - b.p || a.k - b.k);
+
+    let moving = false;
+    const labels = [];
+    for (const it of items) {
+      if (it.o) {
+        const o = it.o, s = o.scale || 1;
+        const url = typeof o.url === "string" ? o.url : (o.url && o.url[0]);
+        if (!url) continue;
+        const im = img(`${GIKO}/rooms/${r.id}/${url}`);
+        if (im) ctx.drawImage(im, (o.offset ? o.offset.x : 0) * s, (o.offset ? o.offset.y : 0) * s, im.naturalWidth * s, im.naturalHeight * s);
+        continue;
+      }
+      const u = it.u;
+      if (walks.has(u.id)) moving = true;
+      const p = userPhys(r, u, now);
+      const back = u.direction === "up" || u.direction === "left";
+      const mirror = u.direction === "left" || u.direction === "down";
+      const base = `${GIKO}/characters/${encodeURIComponent(u.characterId)}/${back ? "back" : "front"}-standing`;
+      const im = img(base + ".svg", base + ".png");
+      const cx = p.x + bw / 2;
+      if (im) {
+        const w = im.naturalWidth * CHAR_SCALE, h = im.naturalHeight * CHAR_SCALE;
+        ctx.save();
+        if (u.isInactive) ctx.globalAlpha = 0.5;
+        if (mirror) { ctx.translate(cx, 0); ctx.scale(-1, 1); ctx.drawImage(im, -w / 2, p.y - h, w, h); }
+        else ctx.drawImage(im, cx - w / 2, p.y - h, w, h);
+        ctx.restore();
+      }
+      labels.push({ x: cx, y: p.y - (im ? im.naturalHeight * CHAR_SCALE : 90) - 6, name: u.name || "Anonymous", mine: u.id === S.userId });
+    }
+
+    // Names on top of everything; ours highlighted with a marker.
+    ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    for (const l of labels) {
+      ctx.font = `${l.mine ? "bold " : ""}15px -apple-system, system-ui, sans-serif`;
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.75)"; ctx.strokeText(l.name, l.x, l.y);
+      ctx.fillStyle = l.mine ? "#4fc3f7" : "#fff"; ctx.fillText(l.name, l.x, l.y);
+      if (l.mine) {
+        ctx.fillStyle = "#4fc3f7";
+        ctx.beginPath(); ctx.moveTo(l.x - 9, l.y - 22); ctx.lineTo(l.x + 9, l.y - 22); ctx.lineTo(l.x, l.y - 10); ctx.closePath(); ctx.fill();
+      }
+    }
+    if (moving) requestDraw();
+  }
+
+  function onRoom() {
+    const r = room();
+    if (r && r.id !== roomId) { roomId = r.id; walks.clear(); doorRequested = false; }
+    requestDraw();
+  }
+  function show() { requestAnimationFrame(draw); }
+  window.addEventListener("resize", requestDraw);
+  return { requestDraw, startWalk, onRoom, show };
+})();
 
 // Keep the avatar from being marked inactive during a long stream.
 setInterval(() => { if (S.loggedIn) emit("user-ping"); }, 5 * 60 * 1000);
@@ -467,7 +640,7 @@ function markZoom() {
 let pinch = null;
 const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
 $("cam").addEventListener("touchstart", (e) => {
-  if (e.touches.length === 2 && zoomCaps() && $("chatPanel").hidden) {
+  if (e.touches.length === 2 && zoomCaps() && $("chatPanel").hidden && !e.target.closest("#roomView")) {
     pinch = { d0: dist(e.touches), z0: currentZoom() }; e.preventDefault();
   }
 }, { passive: false });

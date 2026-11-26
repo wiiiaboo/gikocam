@@ -51,6 +51,13 @@ button { cursor: pointer; }
 .status.is-live::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #fff; margin-right: 6px; vertical-align: 1px; }
 .status.warn { background: rgba(255, 149, 0, .85); color: #000; border-color: transparent; }
 
+#roomView { position: absolute; top: calc(58px + var(--sa-t)); left: calc(10px + var(--sa-l)); right: calc(64px + var(--sa-r));
+  height: 36vh; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: rgba(0, 0, 0, .35);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .4); }
+#roomCanvas { width: 100%; height: 100%; display: block; }
+/* With the room view open, the pad sits under it and the chat feed gets shorter. */
+#cam.moving #pad { top: calc(58px + 36vh + 14px + var(--sa-t)); transform: none; }
+#cam.moving #chatFeed { max-height: 16vh; }
 #pad { position: absolute; left: calc(12px + var(--sa-l)); top: 40%; transform: translateY(-50%);
   display: grid; grid-template-columns: repeat(3, 52px); grid-template-rows: repeat(3, 52px); gap: 4px;
   grid-template-areas: ". up ." "left pos right" ". down ."; touch-action: none; }
