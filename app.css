@@ -30,6 +30,9 @@ button { cursor: pointer; }
 .primary { background: var(--accent); color: #000; border: 0; border-radius: 10px; padding: 12px 18px; font-weight: 600; }
 #enter { width: 100%; font-size: 17px; }
 .error { color: #ff8a80; }
+.rejoin { background: #1e2a31; border: 1px solid var(--accent); border-radius: 12px; padding: 12px; margin-bottom: 14px; }
+.rejoin p { margin: 0 0 10px; }
+.rejoin button { width: 100%; margin-top: 6px; }
 .adv { margin-top: 18px; color: #888; font-size: 13px; }
 
 /* ---------- Camera ---------- */

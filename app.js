@@ -122,7 +122,9 @@ $("enter").onclick = async () => {
   try {
     await startCamera();            // inside the tap, so iOS allows camera + mic
     $("enter").textContent = "Connecting…";
-    await connectRelay();
+    if (!S.ws || S.ws.readyState !== 1) await connectRelay();
+    // A previous session from this phone still in gikopoipoi: end it, or there'd be two of you.
+    if (oldSession) { await request({ t: "end", sessionKey: oldSession.key }, ["ended"]).catch(() => {}); hideRejoin(); }
     const res = await request({ t: "login", name, characterId, areaId, roomId: $("room").value || "admin_st" }, ["login-ok"])
       .catch(e => { throw new Error(/ip_restricted/.test(e.message)
         ? "gikopoipoi refused the login: this network's IP is restricted (ip_restricted)."
@@ -136,6 +138,69 @@ $("enter").onclick = async () => {
     stopCamera();
   }
   $("enter").disabled = false; $("enter").textContent = "Enter";
+};
+
+// ------------------------------------------------------------------ rejoin
+// Closing the browser doesn't end the gikopoipoi session (the relay can't tell
+// it from losing signal, and keeps the stream on the BRB screen). When the page
+// opens again, offer to pick that session back up, or end it.
+let oldSession = null; // {key, name, roomId, live, brb, slot}
+async function checkOldSession() {
+  const key = store.get("session", null);
+  if (!key) return;
+  try {
+    if (!S.ws || S.ws.readyState !== 1) await connectRelay();
+    const p = await request({ t: "peek", sessionKey: key }, ["peek"]);
+    if (!p.alive) { store.set("session", null); return; }
+    oldSession = { ...p, key };
+    $("rejoinText").textContent = `You're still in gikopoipoi as ${p.name || "Anonymous"} in ${p.roomId || "?"}` +
+      (p.brb ? ", viewers are seeing your be-right-back screen." : p.live ? ", still streaming." : ".");
+    $("rejoin").hidden = false;
+    $("enter").textContent = "Enter as someone new";
+  } catch {}
+}
+function hideRejoin() {
+  oldSession = null; store.set("session", null);
+  $("rejoin").hidden = true; $("enter").textContent = "Enter";
+}
+$("endBtn").onclick = async () => {
+  if (!oldSession) return;
+  $("endBtn").disabled = true;
+  await request({ t: "end", sessionKey: oldSession.key }, ["ended"]).catch(() => {});
+  $("endBtn").disabled = false;
+  hideRejoin();
+};
+$("rejoinBtn").onclick = async () => {
+  if (!oldSession) return;
+  const err = $("loginError"); err.hidden = true;
+  const old = oldSession;
+  $("rejoinBtn").disabled = true; $("rejoinBtn").textContent = "Starting camera…";
+  try {
+    await startCamera();            // inside the tap, so iOS allows camera + mic
+    if (!S.ws || S.ws.readyState !== 1) await connectRelay();
+    const res = await request({ t: "resume", sessionKey: old.key }, ["resumed", "resume-failed"]);
+    if (res.t === "resume-failed") throw new Error("That session has just ended. Enter again.");
+    S.sessionKey = old.key; S.userId = res.userId; S.loggedIn = true;
+    S.wantLive = !!old.live;
+    applyRoomState(res.room);
+    for (const m of res.missed) onRelayMessage(m);
+    oldSession = null; $("rejoin").hidden = true;
+    $("login").hidden = true; $("cam").hidden = false;
+    sysMsg(`Rejoined ${roomLabel()}`);
+    acquireWakeLock();
+    if (S.wantLive && !res.brb && Number.isInteger(old.slot)) {
+      // The old page's stream may still hold the slot: stop it, then take the slot again.
+      emit("user-want-to-stop-stream");
+      S.streamState = "off";
+      setTimeout(() => requestStream(old.slot), 1500);
+    }
+    // With the BRB stream up, the relay sends brb-handback once the slot is free.
+    setStatus();
+  } catch (e) {
+    err.textContent = e.message || String(e); err.hidden = false;
+    stopCamera();
+  }
+  $("rejoinBtn").disabled = false; $("rejoinBtn").textContent = "Rejoin";
 };
 
 // ------------------------------------------------------------------ relay connection
@@ -175,7 +240,8 @@ function scheduleRelayReconnect() {
       if (res.t === "resume-failed") { sysMsg("Session expired, logging in again"); return relogin(); }
       applyRoomState(res.room);
       for (const m of res.missed) onRelayMessage(m);
-      if (res.socketConnected && S.wantLive && !S.pc) requestStream();
+      // With the relay's BRB stream up, a brb-handback (with our slot) follows.
+      if (res.socketConnected && S.wantLive && !S.pc && !res.brb) requestStream();
     } catch { /* onclose schedules the next attempt */ }
   }, wait);
 }
@@ -188,6 +254,7 @@ async function relogin() {
 
 function onLoggedIn(res) {
   S.sessionKey = res.sessionKey; S.userId = res.userId; S.loggedIn = true;
+  store.set("session", res.sessionKey);
   applyRoomState(res.room);
   sysMsg(`Joined ${roomLabel()} as ${store.get("name", "") || "Anonymous"}`);
   if (S.wantLive) { closePeer(); requestStream(); }
@@ -833,7 +900,7 @@ const BRB = (() => {
     const [W, H] = gikocamBrb.SIZES[orient];
     canvas = document.createElement("canvas"); canvas.width = W; canvas.height = H;
     ctx = canvas.getContext("2d");
-    alpha = 0; drawn = false; fade = { from: 0, to: 1, t0: performance.now(), ms: 1000 };
+    alpha = 0; lastDraw = 0; fade = { from: 0, to: 1, t0: performance.now(), ms: 1000 };
     frame();
     track = canvas.captureStream(15).getVideoTracks()[0];
     timer = setInterval(frame, 66);
@@ -1000,6 +1067,7 @@ $("quality").onchange = () => { store.set("quality", +$("quality").value); apply
 // ---- settings sheet + live stats
 $("settingsBtn").onclick = () => { $("settingsPanel").hidden = false; renderMics(); renderLenses(); };
 $("logout").onclick = () => {
+  store.set("session", null);
   if (S.wantLive) stopStream();
   send({ t: "logout" }); S.loggedIn = false;
   if (S.ws) S.ws.close();
@@ -1027,6 +1095,8 @@ setInterval(async () => {
   $("stats").textContent = lines.join("\n");
 }, 1000);
 
-window.addEventListener("pagehide", () => { if (S.wantLive) emit("user-want-to-stop-stream"); });
+// Closing the page does not end the stream: like losing signal, the relay puts
+// up the BRB screen and the next visit can Rejoin. End stream / Leave end it.
 
 initLogin();
+checkOldSession();

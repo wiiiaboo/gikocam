@@ -13,6 +13,12 @@
 <!-- Login -->
 <section id="login">
   <h1>gikocam</h1>
+  <!-- Shown when this phone's previous gikopoipoi session is still running on the relay -->
+  <div id="rejoin" class="rejoin" hidden>
+    <p id="rejoinText"></p>
+    <button id="rejoinBtn" class="primary">Rejoin</button>
+    <button id="endBtn" class="danger">End it</button>
+  </div>
   <label class="field">Name
     <input id="name" maxlength="20" autocomplete="off" autocapitalize="off" placeholder="Anonymous">
   </label>

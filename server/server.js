@@ -11,7 +11,9 @@
 //   -> {t:"login", name, characterId, areaId, roomId}
 //   <- {t:"login-ok", sessionKey, userId, room}      room = gikopoipoi room state
 //   -> {t:"resume", sessionKey}                        after a dropped connection
-//   <- {t:"resumed", userId, room, missed:[events]}
+//   <- {t:"resumed", userId, room, missed:[events], brb}  brb: a brb-handback follows
+//   -> {t:"peek", sessionKey}  <- {t:"peek", alive, name, roomId, live, brb}   login screen: still in gikopoipoi?
+//   -> {t:"end", sessionKey}   <- {t:"ended"}               log that session out
 //   -> {t:"emit", event, args:[...]}                   allow-listed socket.io emits
 //   <- {t:"event", event, args:[...]}                  every socket.io event from gikopoipoi
 //   -> {t:"rooms"}            <- {t:"rooms", rooms}
@@ -142,6 +144,7 @@ class Session {
 
   async login({ name, characterId, areaId, roomId }) {
     this.areaId = String(areaId || "for");
+    this.name = String(name ?? "").slice(0, 40);
     const login = await gikoJson("/api/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -502,9 +505,20 @@ wss.on("connection", (ws, req) => {
           s.attach(ws);
           const missed = s.missed; s.missed = [];
           s.phone.lastHb = Date.now();
-          reply({ t: "resumed", userId: s.userId, room: s.room, socketConnected: !!s.socket?.connected, missed });
+          reply({ t: "resumed", userId: s.userId, room: s.room, socketConnected: !!s.socket?.connected, missed, brb: !!s.brb });
           s.handBack("phone back");
           return;
+        }
+        case "peek": {
+          const s = sessions.get(String(msg.sessionKey));
+          return reply(s
+            ? { t: "peek", alive: true, name: s.name, roomId: s.room?.currentRoom?.id || null, live: s.phone.live || !!s.brb, brb: !!s.brb, slot: s.slot }
+            : { t: "peek", alive: false });
+        }
+        case "end": {
+          const s = sessions.get(String(msg.sessionKey));
+          if (s) s.destroy("ended from login screen");
+          return reply({ t: "ended" });
         }
         case "emit": {
           if (!session) return reply({ t: "error", message: "not logged in" });
