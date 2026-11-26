@@ -74,6 +74,14 @@ const log = (event, details = {}) =>
 // gikopoipoi only lists rooms for a logged-in user, so the login screen gets
 // the list from a live session in that area, or the last one any session saw.
 const roomCache = new Map(); // areaId -> {at, rooms}
+// gikopoipoi's rooms as of 2026-11-26, used until a login brings the live list.
+const KNOWN_ROOMS = ["admin", "admin_bar", "admin_st", "bar", "bar774", "bar_giko", "bar_giko2",
+  "bar_giko_square", "bar_st", "basement", "busstop", "cafe_st", "densha", "enkai", "idoA", "idoB", "irori",
+  "izakaya774", "jinja", "jinja_st", "kaidan", "karaoke_box", "koban", "konbini", "kyougijou", "long_st",
+  "matsuri", "meganeya", "monachat", "nerd_office", "radio", "radio_backstage", "radio_gakuya",
+  "radio_room1", "radio_room2", "radio_room3", "river", "school", "school_ground", "school_international",
+  "school_pc", "school_rouka", "school_st", "seashore", "silo", "taiikukan", "takadai", "yane", "yaneura",
+  "yatai", "yojouhan", "yoshinoya"];
 async function roomsForArea(areaId) {
   const live = [...sessions.values()].find((s) => s.areaId === areaId && s.privateUserId);
   if (live) {
@@ -81,7 +89,9 @@ async function roomsForArea(areaId) {
     if (!cached || Date.now() - cached.at > 30_000) await live.rooms().catch(() => {});
   }
   const c = roomCache.get(areaId);
-  return { at: c?.at || null, rooms: (c?.rooms || []).map((r) => ({
+  // Nobody has logged in since the relay started: offer the known rooms without counts.
+  if (!c) return { at: null, rooms: KNOWN_ROOMS.map((id) => ({ id, userCount: 0, streams: 0 })) };
+  return { at: c.at, rooms: c.rooms.map((r) => ({
     id: r.id, userCount: r.userCount || 0, streams: Array.isArray(r.streams) ? r.streams.length : 0,
   })) };
 }
