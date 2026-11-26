@@ -4,7 +4,11 @@
 // straight from this page's RTCPeerConnection to gikopoipoi's media server.
 
 const GIKO = "https://gikopoipoi.net";
-const DEFAULT_RELAY = "wss://gikocam-relay.onrender.com/ws";
+// Served by the relay itself (cam.gikochan.net): use the same address. The old
+// GitHub Pages copy keeps pointing at Render.
+const DEFAULT_RELAY = /github\.io$/.test(location.hostname)
+  ? "wss://gikocam-relay.onrender.com/ws"
+  : new URL("ws", location.href).href.replace(/^http/, "ws");
 const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }] };
 const FALLBACK_CHARS = ["giko", "shii", "naito", "hikki", "shobon", "tinpopo", "nida", "salmon", "giko_hat", "shii_hat"];
 const ZOOM_PRESETS = [0.5, 1, 2, 3, 5];

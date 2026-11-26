@@ -21,6 +21,8 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { WebSocketServer } from "ws";
 import { io } from "socket.io-client";
 
@@ -32,6 +34,33 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
 const RESUME_GRACE_MS = Number(process.env.RESUME_GRACE_MS || 90_000);
 const MAX_MISSED_EVENTS = 300;
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 10);
+// When set, the relay also serves the phone page from this folder (VPS setup).
+const STATIC_DIR = process.env.STATIC_DIR ? path.resolve(process.env.STATIC_DIR) : null;
+const CONTENT_TYPES = {
+  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json",
+};
+
+async function serveStatic(pathname, res) {
+  if (!STATIC_DIR) return false;
+  let rel = decodeURIComponent(pathname);
+  if (rel.endsWith("/")) rel += "index.html";
+  const file = path.join(STATIC_DIR, path.normalize(rel));
+  if (!file.startsWith(STATIC_DIR + path.sep)) return false;
+  try {
+    const body = await fs.readFile(file);
+    res.writeHead(200, {
+      "content-type": CONTENT_TYPES[path.extname(file)] || "application/octet-stream",
+      "cache-control": "no-cache",
+      "x-content-type-options": "nosniff",
+    });
+    res.end(body);
+    return true;
+  } catch {
+    if (!rel.endsWith("index.html") && !path.extname(rel)) return serveStatic(pathname + "/", res);
+    return false;
+  }
+}
 
 // Only what the phone page needs. Anything else is dropped.
 const ALLOWED_EMITS = new Set([
@@ -163,6 +192,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json", "cache-control": "max-age=3600" });
       return res.end(JSON.stringify(Object.keys(catalog)));
     }
+    if (req.method === "GET" && await serveStatic(url.pathname, res)) return;
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("gikocam relay: nothing here. The phone page connects to /ws.");
   } catch (e) {

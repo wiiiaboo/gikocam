@@ -1,0 +1,17 @@
+# Runs behind the shared Caddy on the VPS (network docker-platform_default).
+# No published ports: Caddy proxies cam.gikochan.net -> gikocam:8080.
+services:
+  gikocam:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: gikocam
+    restart: unless-stopped
+    environment:
+      ALLOWED_ORIGINS: https://cam.gikochan.net
+      GIKO_BASE_URL: https://gikopoipoi.net
+    networks: [web]
+networks:
+  web:
+    external: true
+    name: docker-platform_default
