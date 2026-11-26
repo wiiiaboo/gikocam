@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>gikocam – camera test</title>
+<style>
+  :root { color-scheme: dark; --glass: rgba(0,0,0,.45); --accent: #4fc3f7; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font: 14px/1.35 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video { width: 100%; height: 100%; object-fit: cover; background: #111; }
+  #local { position: absolute; inset: 0; }
+  #remote { position: absolute; right: calc(10px + env(safe-area-inset-right)); top: calc(10px + env(safe-area-inset-top));
+    width: 30vw; max-width: 180px; height: auto; aspect-ratio: 9/16; border: 2px solid var(--accent); border-radius: 8px; object-fit: cover; }
+  #remoteLabel { position: absolute; right: calc(14px + env(safe-area-inset-right)); top: calc(14px + env(safe-area-inset-top));
+    font-size: 10px; background: var(--glass); padding: 2px 5px; border-radius: 4px; z-index: 2; }
+  .panel { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(0,0,0,.75) 25%); }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  button, select { font: inherit; color: #fff; background: var(--glass); border: 1px solid rgba(255,255,255,.3);
+    border-radius: 999px; padding: 8px 12px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  button.active { background: var(--accent); color: #000; border-color: var(--accent); }
+  button.virtual { opacity: .6; font-style: italic; }
+  select { border-radius: 8px; max-width: 100%; }
+  #stats { position: absolute; left: calc(10px + env(safe-area-inset-left)); top: calc(10px + env(safe-area-inset-top));
+    background: var(--glass); padding: 6px 8px; border-radius: 6px; font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre; }
+  #log { position: absolute; left: 10px; right: 10px; top: 25%; bottom: 220px; overflow: auto; display: none;
+    background: rgba(0,0,0,.8); border-radius: 8px; padding: 8px; font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  #log.show { display: block; }
+  #start { position: absolute; inset: 0; margin: auto; width: 220px; height: 64px; font-size: 18px; background: var(--accent); color: #000; border: 0; }
+  label { font-size: 12px; display: flex; gap: 4px; align-items: center; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="local" playsinline autoplay muted></video>
+  <video id="remote" playsinline autoplay muted></video>
+  <div id="remoteLabel">loopback (what viewers get)</div>
+  <div id="stats"></div>
+  <div id="log"></div>
+  <div class="panel" id="panel" hidden>
+    <div class="row" id="lenses"></div>
+    <div class="row">
+      <select id="mic"></select>
+      <select id="quality">
+        <option value="500000">Low 0.5 Mbps</option>
+        <option value="1000000" selected>Med 1 Mbps</option>
+        <option value="2500000">High 2.5 Mbps</option>
+      </select>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="stopFirst"> stop old cam first</label>
+      <label><input type="checkbox" id="showVirtual"> show Dual/Triple</label>
+      <button id="wake">Wake lock: off</button>
+      <button id="logBtn">Log</button>
+      <button id="copy">Copy report</button>
+    </div>
+  </div>
+  <button id="start">Start camera test</button>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const logLines = [];
+function log(...a) {
+  const line = new Date().toISOString().slice(11, 23) + ' ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ');
+  logLines.push(line); console.log(line);
+  $('log').textContent = logLines.join('\n'); $('log').scrollTop = 1e9;
+}
+window.addEventListener('error', e => log('ERROR', e.message));
+window.addEventListener('unhandledrejection', e => log('REJECT', String(e.reason && (e.reason.name + ': ' + e.reason.message) || e.reason)));
+
+let videoTrack = null, audioTrack = null, pcA = null, pcB = null, vSender = null, aSender = null;
+let devices = [], currentVideoId = null, wakeLock = null, switching = false;
+const isVirtual = (label) => /dual|triple/i.test(label);
+
+log('UA', navigator.userAgent);
+
+$('start').onclick = async () => {
+  $('start').hidden = true;
+  try {
+    // One initial request (any back camera + mic) unlocks device labels on iOS.
+    const s = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true });
+    videoTrack = s.getVideoTracks()[0]; audioTrack = s.getAudioTracks()[0];
+    describeTrack('initial video', videoTrack); describeTrack('initial audio', audioTrack);
+    currentVideoId = videoTrack.getSettings().deviceId;
+    $('local').srcObject = new MediaStream([videoTrack]);
+    await setupLoopback();
+    await refreshDevices();
+    $('panel').hidden = false;
+    setInterval(updateStats, 1000);
+  } catch (e) { log('START FAILED', e.name + ': ' + e.message); $('start').hidden = false; }
+};
+
+function describeTrack(tag, t) {
+  if (!t) return log(tag, 'none');
+  log(tag, { label: t.label, settings: t.getSettings && t.getSettings(),
+    capabilities: t.getCapabilities ? t.getCapabilities() : 'getCapabilities unsupported' });
+}
+
+async function refreshDevices() {
+  devices = await navigator.mediaDevices.enumerateDevices();
+  log('devices', devices.map(d => ({ kind: d.kind, label: d.label, id: d.deviceId.slice(0, 8) })));
+  renderLenses();
+  const mic = $('mic'); mic.innerHTML = '';
+  for (const d of devices.filter(d => d.kind === 'audioinput')) {
+    const o = document.createElement('option'); o.value = d.deviceId; o.textContent = '🎤 ' + (d.label || 'mic');
+    if (audioTrack && audioTrack.getSettings().deviceId === d.deviceId) o.selected = true;
+    mic.appendChild(o);
+  }
+}
+
+function renderLenses() {
+  const box = $('lenses'); box.innerHTML = '';
+  for (const d of devices.filter(d => d.kind === 'videoinput')) {
+    const virt = isVirtual(d.label);
+    if (virt && !$('showVirtual').checked) continue;
+    const b = document.createElement('button');
+    b.textContent = d.label.replace(/ Camera$/i, '') || 'camera';
+    if (virt) b.classList.add('virtual');
+    if (d.deviceId === currentVideoId) b.classList.add('active');
+    b.onclick = () => switchCamera(d.deviceId, d.label);
+    box.appendChild(b);
+  }
+}
+$('showVirtual').onchange = renderLenses;
+
+// Loopback: pcA (phone -> "media server") and pcB (stands in for the server/viewer)
+// in the same page. Proves replaceTrack swaps the lens without renegotiating.
+async function setupLoopback() {
+  pcA = new RTCPeerConnection(); pcB = new RTCPeerConnection();
+  pcA.onicecandidate = e => e.candidate && pcB.addIceCandidate(e.candidate);
+  pcB.onicecandidate = e => e.candidate && pcA.addIceCandidate(e.candidate);
+  pcA.onnegotiationneeded = () => log('!! negotiationneeded fired on sender');
+  const remoteStream = new MediaStream();
+  pcB.ontrack = e => { remoteStream.addTrack(e.track); $('remote').srcObject = remoteStream; };
+  const ms = new MediaStream([videoTrack, audioTrack].filter(Boolean));
+  vSender = pcA.addTrack(videoTrack, ms);
+  if (audioTrack) aSender = pcA.addTrack(audioTrack, ms);
+  const offer = await pcA.createOffer(); await pcA.setLocalDescription(offer);
+  await pcB.setRemoteDescription(offer);
+  const answer = await pcB.createAnswer(); await pcB.setLocalDescription(answer);
+  await pcA.setRemoteDescription(answer);
+  pcA.onnegotiationneeded = () => log('!! negotiationneeded fired on sender (would need re-offer)');
+  await applyBitrate();
+  log('loopback connected');
+}
+
+async function switchCamera(deviceId, label) {
+  if (switching || deviceId === currentVideoId) return;
+  switching = true;
+  const t0 = performance.now();
+  try {
+    const old = videoTrack;
+    if ($('stopFirst').checked) old.stop();
+    const s = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    const t1 = performance.now();
+    const nt = s.getVideoTracks()[0];
+    await vSender.replaceTrack(nt);
+    const t2 = performance.now();
+    if (old.readyState !== 'ended') old.stop();
+    videoTrack = nt; currentVideoId = deviceId;
+    $('local').srcObject = new MediaStream([nt]);
+    // Time until the loopback (viewer side) actually renders a new frame.
+    const firstFrame = await nextRemoteFrame();
+    log(`switch -> ${label}: getUserMedia ${(t1 - t0) | 0}ms, replaceTrack ${(t2 - t1) | 0}ms, viewer frame +${(firstFrame - t0) | 0}ms total`);
+    describeTrack('new video', nt);
+    if (audioTrack && audioTrack.readyState === 'ended') log('!! audio track ended during camera switch');
+  } catch (e) { log('switch FAILED', label, e.name + ': ' + e.message); }
+  switching = false; renderLenses();
+}
+
+function nextRemoteFrame() {
+  const v = $('remote');
+  return new Promise(res => {
+    if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => res(performance.now()));
+    else setTimeout(() => res(performance.now()), 0);
+  });
+}
+
+$('mic').onchange = async (e) => {
+  const t0 = performance.now();
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: e.target.value } } });
+    const nt = s.getAudioTracks()[0];
+    await aSender.replaceTrack(nt);
+    if (audioTrack) audioTrack.stop();
+    audioTrack = nt;
+    log(`mic switch -> ${nt.label} in ${(performance.now() - t0) | 0}ms; video track state: ${videoTrack.readyState}, muted: ${videoTrack.muted}`);
+  } catch (err) { log('mic switch FAILED', err.name + ': ' + err.message); }
+};
+
+async function applyBitrate() {
+  const p = vSender.getParameters();
+  if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = +$('quality').value;
+  try { await vSender.setParameters(p); log('maxBitrate set', p.encodings[0].maxBitrate); }
+  catch (e) { log('setParameters FAILED', e.name + ': ' + e.message); }
+}
+$('quality').onchange = applyBitrate;
+
+let lastBytes = 0, lastTs = 0;
+async function updateStats() {
+  if (!pcA) return;
+  const stats = await pcA.getStats(vSender.track ? vSender : null);
+  let out = '';
+  stats.forEach(r => {
+    if (r.type === 'outbound-rtp' && r.kind === 'video') {
+      const kbps = lastTs ? ((r.bytesSent - lastBytes) * 8 / (r.timestamp - lastTs)) | 0 : 0;
+      lastBytes = r.bytesSent; lastTs = r.timestamp;
+      out = `send ${kbps} kbps\n${r.frameWidth || '?'}x${r.frameHeight || '?'} @ ${r.framesPerSecond || '?'}fps\n` +
+            `limit: ${r.qualityLimitationReason || '-'}`;
+    }
+  });
+  const s = videoTrack ? videoTrack.getSettings() : {};
+  $('stats').textContent = out + `\ncam ${s.width}x${s.height}\n${videoTrack ? videoTrack.label : ''}` +
+    `\nwake: ${wakeLock ? 'on' : 'off'}`;
+}
+
+$('wake').onclick = async () => {
+  try {
+    if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+    else if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.onrelease = () => log('wake lock released by system'); }
+    else log('Wake Lock API not supported');
+  } catch (e) { log('wake lock FAILED', e.name + ': ' + e.message); }
+  $('wake').textContent = 'Wake lock: ' + (wakeLock ? 'on' : 'off');
+};
+document.addEventListener('visibilitychange', () => log('visibility', document.visibilityState,
+  'video', videoTrack && videoTrack.readyState, 'muted', videoTrack && videoTrack.muted));
+
+$('logBtn').onclick = () => $('log').classList.toggle('show');
+$('copy').onclick = async () => {
+  const text = logLines.join('\n');
+  try { await navigator.clipboard.writeText(text); log('report copied to clipboard'); }
+  catch { $('log').classList.add('show'); log('clipboard blocked – select the log text manually'); }
+};
+</script>
+</body>
+</html>
