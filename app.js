@@ -1,0 +1,638 @@
+"use strict";
+// gikocam phone client.
+// Signalling + chat go through the relay (see server/server.js). Video goes
+// straight from this page's RTCPeerConnection to gikopoipoi's media server.
+
+const GIKO = "https://gikopoipoi.net";
+const DEFAULT_RELAY = "wss://gikocam-relay.onrender.com/ws";
+const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }] };
+const FALLBACK_CHARS = ["giko", "shii", "naito", "hikki", "shobon", "tinpopo", "nida", "salmon", "giko_hat", "shii_hat"];
+const ZOOM_PRESETS = [0.5, 1, 2, 3, 5];
+const CHAT_FADE_MS = 15000;
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get: (k, d) => { try { const v = localStorage.getItem("gikocam." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem("gikocam." + k, JSON.stringify(v)); } catch {} },
+};
+
+// ------------------------------------------------------------------ state
+const S = {
+  relayUrl: new URLSearchParams(location.search).get("relay") || store.get("relay", DEFAULT_RELAY),
+  ws: null, sessionKey: null, userId: null, loggedIn: false, relayRetry: 0,
+  room: null, users: new Map(), streams: [],
+  // camera
+  videoTrack: null, audioTrack: null, devices: [], backId: null, frontId: null, facing: "back", fixedLensId: null,
+  micMuted: false, wakeLock: null,
+  // stream
+  wantLive: false, slot: null, pc: null, pendingOffer: null, streamState: "off", peerRetry: 0,
+};
+if (new URLSearchParams(location.search).get("relay")) store.set("relay", S.relayUrl);
+
+// ------------------------------------------------------------------ UI helpers
+function toast(text, ms = 3000) {
+  const t = $("toast"); t.textContent = text; t.hidden = false;
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { t.hidden = true; }, ms);
+}
+function setStatus() {
+  const el = $("status");
+  let text = "offline", cls = "";
+  const relayUp = S.ws && S.ws.readyState === 1;
+  if (!relayUp) { text = S.loggedIn ? "reconnecting…" : "offline"; cls = "warn"; }
+  else if (S.streamState === "live") { text = "LIVE"; cls = "is-live"; }
+  else if (S.streamState === "requesting" || S.streamState === "connecting") { text = "connecting…"; cls = "warn"; }
+  else if (S.streamState === "reconnecting") { text = "stream reconnecting…"; cls = "warn"; }
+  else text = "not streaming";
+  el.textContent = text; el.className = "pill status " + cls;
+  const live = $("live");
+  live.textContent = S.wantLive ? "End stream" : "Go live";
+  live.classList.toggle("on", S.wantLive);
+}
+
+// ------------------------------------------------------------------ login screen
+async function initLogin() {
+  $("name").value = store.get("name", "");
+  $("area").value = store.get("area", "for");
+  $("relayUrl").value = S.relayUrl;
+  let chars = FALLBACK_CHARS;
+  try {
+    const r = await fetch(S.relayUrl.replace(/^ws/, "http").replace(/\/ws$/, "/characters"));
+    if (r.ok) chars = await r.json();
+  } catch {}
+  const selected = store.get("character", "giko");
+  const box = $("chars"); box.innerHTML = "";
+  for (const id of chars) {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.id = id; b.title = id;
+    const img = document.createElement("img");
+    img.loading = "lazy"; img.alt = id;
+    img.src = `${GIKO}/characters/${encodeURIComponent(id)}/front-standing.svg`;
+    img.onerror = () => b.remove();
+    b.appendChild(img);
+    if (id === selected) b.classList.add("sel");
+    b.onclick = () => { box.querySelectorAll(".sel").forEach(x => x.classList.remove("sel")); b.classList.add("sel"); };
+    box.appendChild(b);
+  }
+  if (!box.querySelector(".sel") && box.firstChild) box.firstChild.classList.add("sel");
+}
+
+$("enter").onclick = async () => {
+  const err = $("loginError"); err.hidden = true;
+  const name = $("name").value.trim();
+  const sel = $("chars").querySelector(".sel");
+  const characterId = sel ? sel.dataset.id : "giko";
+  const areaId = $("area").value;
+  const relay = $("relayUrl").value.trim() || DEFAULT_RELAY;
+  store.set("name", name); store.set("character", characterId); store.set("area", areaId); store.set("relay", relay);
+  S.relayUrl = relay;
+  $("enter").disabled = true; $("enter").textContent = "Starting camera…";
+  try {
+    await startCamera();            // inside the tap, so iOS allows camera + mic
+    $("enter").textContent = "Connecting…";
+    await connectRelay();
+    const res = await request({ t: "login", name, characterId, areaId, roomId: store.get("room:" + areaId, "admin_st") }, ["login-ok"])
+      .catch(e => { throw new Error(/\/api\/login/.test(e.message)
+        ? "gikopoipoi refused the login (" + e.message.split(" ")[0] + "). Wait a minute and try again." : e.message); });
+    onLoggedIn(res);
+    $("login").hidden = true; $("cam").hidden = false;
+    acquireWakeLock();
+  } catch (e) {
+    err.textContent = e.message || String(e); err.hidden = false;
+    stopCamera();
+  }
+  $("enter").disabled = false; $("enter").textContent = "Enter";
+};
+
+// ------------------------------------------------------------------ relay connection
+let pending = null; // {types, resolve, reject}
+function connectRelay() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(S.relayUrl);
+    S.ws = ws;
+    const timer = setTimeout(() => { ws.close(); reject(new Error("Relay server did not answer (it may be waking up — try again in a minute)")); }, 60000);
+    ws.onopen = () => { clearTimeout(timer); S.relayRetry = 0; setStatus(); resolve(); };
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      clearTimeout(timer);
+      if (S.ws !== ws) return;
+      setStatus();
+      if (pending) { pending.reject(new Error("Lost connection to relay")); pending = null; }
+      if (S.loggedIn) scheduleRelayReconnect(); else reject(new Error("Could not reach relay server"));
+    };
+    ws.onmessage = (ev) => onRelayMessage(JSON.parse(ev.data));
+  });
+}
+function send(msg) { if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(msg)); }
+function emit(event, ...args) { send({ t: "emit", event, args }); }
+function request(msg, types) {
+  return new Promise((resolve, reject) => { pending = { types, resolve, reject }; send(msg); });
+}
+
+function scheduleRelayReconnect() {
+  const wait = Math.min(10000, 500 * 2 ** S.relayRetry++);
+  setTimeout(async () => {
+    if (!S.loggedIn) return;
+    try {
+      await connectRelay();
+      const res = await request({ t: "resume", sessionKey: S.sessionKey }, ["resumed", "resume-failed"]);
+      if (res.t === "resume-failed") { sysMsg("Session expired, logging in again"); return relogin(); }
+      applyRoomState(res.room);
+      for (const m of res.missed) onRelayMessage(m);
+      if (res.socketConnected && S.wantLive && !S.pc) requestStream();
+    } catch { /* onclose schedules the next attempt */ }
+  }, wait);
+}
+
+async function relogin() {
+  const name = store.get("name", ""), characterId = store.get("character", "giko"), areaId = store.get("area", "for");
+  const res = await request({ t: "login", name, characterId, areaId, roomId: S.room?.currentRoom?.id || "admin_st" }, ["login-ok"]);
+  onLoggedIn(res);
+}
+
+function onLoggedIn(res) {
+  S.sessionKey = res.sessionKey; S.userId = res.userId; S.loggedIn = true;
+  applyRoomState(res.room);
+  sysMsg(`Joined ${roomLabel()} as ${store.get("name", "") || "Anonymous"}`);
+  if (S.wantLive) { closePeer(); requestStream(); }
+  setStatus();
+}
+
+function onRelayMessage(m) {
+  if (pending && (pending.types.includes(m.t) || m.t === "error")) {
+    const p = pending; pending = null;
+    if (m.t === "error") p.reject(new Error(m.message)); else p.resolve(m);
+    return;
+  }
+  switch (m.t) {
+    case "event": return onGikoEvent(m.event, m.args || []);
+    case "rooms": return renderRooms(m.rooms);
+    case "socket":
+      if (m.state === "connected") { if (S.wantLive && !S.pc) requestStream(); }
+      else if (m.state === "disconnected") { sysMsg("gikopoipoi connection dropped, reconnecting…"); closePeer(); S.streamState = S.wantLive ? "reconnecting" : "off"; }
+      else if (m.state === "rejected") { sysMsg("gikopoipoi rejected the session"); S.wantLive = false; closePeer(); }
+      return setStatus();
+    case "error": return toast(m.message);
+  }
+}
+
+// ------------------------------------------------------------------ gikopoipoi events
+function applyRoomState(state) {
+  if (!state) return;
+  S.room = state;
+  S.users = new Map((state.connectedUsers || []).map(u => [u.id, u]));
+  S.streams = state.streams || [];
+  if (state.currentRoom) store.set("room:" + store.get("area", "for"), state.currentRoom.id);
+  $("roomName").textContent = roomLabel();
+  $("userCount").textContent = S.users.size;
+}
+const roomLabel = () => (S.room && S.room.currentRoom && S.room.currentRoom.id) || "?";
+const userName = (id) => { const u = S.users.get(id); return u ? (u.name || "Anonymous") : "?"; };
+
+function onGikoEvent(event, args) {
+  switch (event) {
+    case "server-update-current-room-state":
+      { const before = roomLabel(); applyRoomState(args[0]); if (roomLabel() !== before) sysMsg(`Now in ${roomLabel()}`); }
+      checkOwnSlot();
+      break;
+    case "server-user-joined-room":
+      S.users.set(args[0].id, args[0]); $("userCount").textContent = S.users.size;
+      sysMsg(`${args[0].name || "Anonymous"} joined`);
+      break;
+    case "server-user-left-room":
+      sysMsg(`${userName(args[0])} left`);
+      S.users.delete(args[0]); $("userCount").textContent = S.users.size;
+      break;
+    case "server-msg":
+      if (args[1]) chatMsg(userName(args[0]), args[1], args[0] === S.userId);
+      break;
+    case "server-system-message":
+      sysMsg(String(args[0]).replace(/_/g, " ") + (args[1] ? " " + args[1] : ""));
+      break;
+    case "server-update-current-room-streams":
+      S.streams = args[0] || []; checkOwnSlot();
+      break;
+    case "server-ok-to-stream":
+      startPeer();
+      break;
+    case "server-not-ok-to-stream":
+      sysMsg("Stream refused: " + String(args[0] || "no reason given").replace(/_/g, " "));
+      S.wantLive = false; S.slot = null; S.streamState = "off"; setStatus();
+      break;
+    case "server-rtc-message":
+      onRtcMessage(args[0], args[1], args[2]);
+      break;
+  }
+}
+
+function checkOwnSlot() {
+  if (S.slot === null || !S.pc) return;
+  const s = S.streams[S.slot];
+  if (s && s.isActive && s.userId === S.userId) return;
+  if (S.streamState === "requesting") return;
+  // Our slot went away (room change, kicked, server restart).
+  closePeer(); S.slot = null;
+  if (S.wantLive) { S.streamState = "reconnecting"; setTimeout(requestStream, 1500); }
+  else S.streamState = "off";
+  setStatus();
+}
+
+// ------------------------------------------------------------------ chat
+function addLine(container, el) {
+  container.appendChild(el);
+  while (container.children.length > 200) container.firstChild.remove();
+}
+function makeMsg(name, text, cls) {
+  const d = document.createElement("div"); d.className = "msg " + (cls || "");
+  if (name) { const b = document.createElement("b"); b.textContent = name; d.appendChild(b); }
+  d.appendChild(document.createTextNode(text));
+  return d;
+}
+function chatMsg(name, text, mine) { postMsg(makeMsg(name, text, mine ? "mine" : "")); }
+function sysMsg(text) { postMsg(makeMsg("", text, "sys")); }
+function postMsg(el) {
+  addLine($("chatLog"), el.cloneNode(true));
+  $("chatLog").scrollTop = 1e9;
+  const feed = $("chatFeed");
+  addLine(feed, el);
+  while (feed.children.length > 8) feed.firstChild.remove();
+  setTimeout(() => el.classList.add("fade"), CHAT_FADE_MS);
+  setTimeout(() => el.remove(), CHAT_FADE_MS + 1000);
+}
+$("chatBtn").onclick = () => { $("chatPanel").hidden = false; $("chatFeed").hidden = true; $("chatLog").scrollTop = 1e9; $("chatInput").focus(); };
+$("chatClose").onclick = () => { $("chatPanel").hidden = true; $("chatFeed").hidden = false; $("chatInput").blur(); };
+$("chatForm").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("chatInput").value.trim();
+  if (!text) return;
+  emit("user-msg", text);
+  $("chatInput").value = "";
+};
+
+// ------------------------------------------------------------------ rooms
+$("roomBtn").onclick = () => { $("roomsPanel").hidden = false; $("roomsList").textContent = "Loading…"; send({ t: "rooms" }); };
+function renderRooms(rooms) {
+  const box = $("roomsList"); box.innerHTML = "";
+  rooms.sort((a, b) => b.userCount - a.userCount);
+  for (const r of rooms) {
+    const b = document.createElement("button");
+    if (r.id === roomLabel()) b.classList.add("here");
+    const name = document.createElement("span"); name.textContent = r.id;
+    const info = document.createElement("small");
+    info.textContent = `${r.userCount}👤` + (r.streams && r.streams.length ? ` · ${r.streams.length} streaming` : "");
+    b.append(name, info);
+    b.onclick = () => {
+      $("roomsPanel").hidden = true;
+      if (r.id === roomLabel()) return;
+      if (S.wantLive) toast("Your stream will restart in the new room");
+      emit("user-change-room", { targetRoomId: r.id });
+    };
+    box.appendChild(b);
+  }
+}
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".sheet").hidden = true; });
+
+// ------------------------------------------------------------------ camera
+const videoConstraints = (deviceId) => ({
+  deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 },
+});
+
+async function startCamera() {
+  const s = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    audio: { echoCancellation: true, noiseSuppression: true },
+  });
+  S.videoTrack = s.getVideoTracks()[0];
+  S.audioTrack = s.getAudioTracks()[0];
+  await refreshDevices();
+  const cur = S.videoTrack.getSettings().deviceId;
+  if (S.backId && cur !== S.backId) await setVideoDevice(S.backId);
+  else showPreview();
+  renderMics();
+}
+
+function stopCamera() {
+  for (const t of [S.videoTrack, S.audioTrack]) if (t) t.stop();
+  S.videoTrack = S.audioTrack = null;
+}
+
+async function refreshDevices() {
+  S.devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = S.devices.filter(d => d.kind === "videoinput");
+  const find = (re) => cams.find(d => re.test(d.label));
+  // The "Triple"/"Dual Wide" virtual cameras switch lenses by themselves while
+  // zooming (0.5x–10x), like the iPhone Camera app.
+  S.backId = (find(/back triple/i) || find(/back dual wide/i) || find(/back dual/i) || find(/^back camera$/i) ||
+              find(/back|rear|environment/i) || cams[0] || {}).deviceId || null;
+  S.frontId = (find(/^front camera$/i) || find(/front|user|face/i) || {}).deviceId || null;
+  $("flip").hidden = !S.frontId;
+  renderLenses();
+}
+
+async function setVideoDevice(deviceId) {
+  const old = S.videoTrack;
+  let nt;
+  try {
+    nt = (await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId) })).getVideoTracks()[0];
+  } catch (e) {
+    // iOS sometimes refuses a second camera while one is open; free it and retry.
+    if (old) old.stop();
+    nt = (await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId) })).getVideoTracks()[0];
+  }
+  const sender = videoSender();
+  if (sender) await sender.replaceTrack(nt);
+  if (old && old !== nt) old.stop();
+  S.videoTrack = nt;
+  showPreview();
+}
+
+function showPreview() {
+  const v = $("preview");
+  v.srcObject = new MediaStream([S.videoTrack]);
+  v.classList.toggle("mirror", S.videoTrack.getSettings().facingMode === "user");
+  renderZooms(); renderTorch(); renderLenses();
+}
+
+$("flip").onclick = async () => {
+  const toFront = S.facing === "back";
+  const id = toFront ? S.frontId : (S.fixedLensId || S.backId);
+  if (!id) return;
+  try { await setVideoDevice(id); S.facing = toFront ? "front" : "back"; }
+  catch (e) { toast("Camera switch failed: " + e.message); }
+};
+
+// ---- zoom
+const zoomCaps = () => {
+  const c = S.videoTrack && S.videoTrack.getCapabilities ? S.videoTrack.getCapabilities() : {};
+  // Single lenses advertise zoom but ignore it on iOS; only offer it on cameras whose min < 1 (virtual multi-lens).
+  return c.zoom && c.zoom.min < 1 ? c.zoom : null;
+};
+let zoomBusy = false, zoomNext = null;
+async function setZoom(z) {
+  const caps = zoomCaps(); if (!caps) return;
+  z = Math.min(caps.max, Math.max(caps.min, z));
+  if (zoomBusy) { zoomNext = z; return; }
+  zoomBusy = true;
+  try { await S.videoTrack.applyConstraints({ advanced: [{ zoom: z }] }); } catch {}
+  zoomBusy = false;
+  markZoom();
+  if (zoomNext !== null) { const n = zoomNext; zoomNext = null; setZoom(n); }
+}
+function currentZoom() { return (S.videoTrack && S.videoTrack.getSettings().zoom) || 1; }
+function renderZooms() {
+  const box = $("zooms"); box.innerHTML = "";
+  const caps = zoomCaps(); if (!caps) return;
+  for (const z of ZOOM_PRESETS.filter(z => z >= caps.min && z <= caps.max)) {
+    const b = document.createElement("button"); b.dataset.z = z;
+    b.onclick = () => setZoom(z);
+    box.appendChild(b);
+  }
+  markZoom();
+}
+function markZoom() {
+  const z = currentZoom();
+  let best = null;
+  for (const b of $("zooms").children) {
+    const p = +b.dataset.z;
+    if (p <= z + 0.01) best = b;
+    b.textContent = p + "×"; b.classList.remove("sel");
+  }
+  if (best) { best.classList.add("sel"); if (Math.abs(+best.dataset.z - z) > 0.05) best.textContent = z.toFixed(1) + "×"; }
+}
+
+let pinch = null;
+const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+$("cam").addEventListener("touchstart", (e) => {
+  if (e.touches.length === 2 && zoomCaps() && $("chatPanel").hidden) {
+    pinch = { d0: dist(e.touches), z0: currentZoom() }; e.preventDefault();
+  }
+}, { passive: false });
+$("cam").addEventListener("touchmove", (e) => {
+  if (pinch && e.touches.length === 2) { e.preventDefault(); setZoom(pinch.z0 * dist(e.touches) / pinch.d0); }
+}, { passive: false });
+$("cam").addEventListener("touchend", (e) => { if (e.touches.length < 2) pinch = null; });
+document.addEventListener("gesturestart", (e) => e.preventDefault());
+
+// ---- torch
+function renderTorch() {
+  const caps = S.videoTrack.getCapabilities ? S.videoTrack.getCapabilities() : {};
+  $("torch").hidden = !caps.torch;
+  $("torch").classList.toggle("on", !!S.videoTrack.getSettings().torch);
+}
+$("torch").onclick = async () => {
+  const on = !S.videoTrack.getSettings().torch;
+  try { await S.videoTrack.applyConstraints({ advanced: [{ torch: on }] }); } catch (e) { toast("Torch: " + e.message); }
+  renderTorch();
+};
+
+// ---- fixed lenses (settings)
+function renderLenses() {
+  const box = $("lenses"); box.innerHTML = "";
+  const cams = S.devices.filter(d => d.kind === "videoinput" && !/dual|triple/i.test(d.label));
+  const auto = document.createElement("button");
+  auto.textContent = "Auto (pinch zoom)";
+  auto.classList.toggle("sel", !S.fixedLensId && S.facing === "back");
+  auto.onclick = async () => { S.fixedLensId = null; S.facing = "back"; await setVideoDevice(S.backId).catch(e => toast(e.message)); };
+  box.appendChild(auto);
+  const cur = S.videoTrack && S.videoTrack.getSettings().deviceId;
+  for (const d of cams) {
+    const b = document.createElement("button");
+    b.textContent = d.label.replace(/ camera$/i, "");
+    b.classList.toggle("sel", !!S.fixedLensId && d.deviceId === cur);
+    b.onclick = async () => {
+      const front = /front/i.test(d.label);
+      S.fixedLensId = front ? null : d.deviceId; S.facing = front ? "front" : "back";
+      await setVideoDevice(d.deviceId).catch(e => toast(e.message));
+    };
+    box.appendChild(b);
+  }
+}
+
+// ---- microphone
+function renderMics() {
+  const sel = $("mic"); sel.innerHTML = "";
+  const cur = S.audioTrack && S.audioTrack.getSettings().deviceId;
+  for (const d of S.devices.filter(d => d.kind === "audioinput")) {
+    const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || "Microphone";
+    o.selected = d.deviceId === cur; sel.appendChild(o);
+  }
+}
+$("mic").onchange = async (e) => {
+  try {
+    const nt = (await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: e.target.value } } })).getAudioTracks()[0];
+    nt.enabled = !S.micMuted;
+    const sender = audioSender();
+    if (sender) await sender.replaceTrack(nt);
+    if (S.audioTrack) S.audioTrack.stop();
+    S.audioTrack = nt;
+  } catch (err) { toast("Mic switch failed: " + err.message); }
+};
+$("mute").onclick = () => {
+  S.micMuted = !S.micMuted;
+  if (S.audioTrack) S.audioTrack.enabled = !S.micMuted;
+  $("mute").classList.toggle("off", S.micMuted);
+  $("mute").textContent = S.micMuted ? "🔇" : "🎤";
+};
+navigator.mediaDevices && navigator.mediaDevices.addEventListener("devicechange", async () => {
+  await refreshDevices(); renderMics();
+});
+
+// ---- wake lock
+async function acquireWakeLock() {
+  if (!("wakeLock" in navigator) || S.wakeLock) return;
+  try { S.wakeLock = await navigator.wakeLock.request("screen"); S.wakeLock.onrelease = () => { S.wakeLock = null; }; } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && S.loggedIn) {
+    acquireWakeLock();
+    // iOS ends camera tracks when the page is backgrounded; bring them back.
+    if (S.videoTrack && S.videoTrack.readyState === "ended") {
+      setVideoDevice(S.facing === "front" ? S.frontId : (S.fixedLensId || S.backId)).catch(() => {});
+    }
+    if (S.audioTrack && S.audioTrack.readyState === "ended") $("mic").dispatchEvent(new Event("change"));
+  }
+});
+
+// ------------------------------------------------------------------ streaming
+$("live").onclick = () => {
+  if (S.wantLive) stopStream(); else { S.wantLive = true; requestStream(); }
+  setStatus();
+};
+
+function requestStream() {
+  if (!S.wantLive || S.pc || S.streamState === "requesting") return;
+  const slot = S.streams.findIndex(s => !s.isActive);
+  if (slot < 0) {
+    toast(S.streams.length ? "Every stream slot in this room is taken" : "This room has no stream slots. Pick another room.", 4000);
+    S.wantLive = false; setStatus();
+    $("roomBtn").click();
+    return;
+  }
+  S.slot = slot; S.streamState = "requesting";
+  setTimeout(() => {
+    if (S.streamState === "requesting" && !S.pc) {
+      sysMsg("gikopoipoi didn't answer the stream request, retrying");
+      S.streamState = "off"; S.slot = null; requestStream();
+    }
+  }, 10000);
+  emit("user-want-to-stream", {
+    streamSlotId: slot, withVideo: true, withSound: true,
+    isVisibleOnlyToSpecificUsers: false, streamIsVtuberMode: false, isNicoNicoMode: false,
+    info: [S.audioTrack, S.videoTrack].filter(Boolean).map(t => ({
+      constraints: t.getConstraints && t.getConstraints(), settings: t.getSettings && t.getSettings(),
+    })),
+  });
+  setStatus();
+}
+
+function startPeer() {
+  closePeer(false);
+  const pc = new RTCPeerConnection(ICE);
+  S.pc = pc; S.streamState = "connecting";
+  pc.addEventListener("negotiationneeded", async () => {
+    try {
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      S.pendingOffer = offer.sdp;
+      emit("user-rtc-message", { streamSlotId: S.slot, type: "offer", msg: offer.sdp });
+    } catch (e) { sysMsg("Offer failed: " + e.message); restartPeer(); }
+  });
+  pc.addEventListener("iceconnectionstatechange", () => {
+    const st = pc.iceConnectionState;
+    if (st === "connected" || st === "completed") {
+      S.streamState = "live"; S.peerRetry = 0; applyBitrate(); setStatus();
+    } else if (st === "disconnected") {
+      S.streamState = "reconnecting"; setStatus();
+      // Mobile data hiccup; give ICE a few seconds to recover by itself.
+      setTimeout(() => { if (S.pc === pc && pc.iceConnectionState === "disconnected") restartPeer(); }, 6000);
+    } else if (st === "failed") restartPeer();
+  });
+  const ms = new MediaStream([S.videoTrack, S.audioTrack].filter(Boolean));
+  for (const t of ms.getTracks()) pc.addTrack(t, ms);
+  setStatus();
+}
+
+async function onRtcMessage(slotId, type, msg) {
+  const pc = S.pc;
+  if (!pc || slotId !== S.slot) return;
+  try {
+    if (type === "answer" && typeof msg === "string") {
+      if (S.pendingOffer) { await pc.setLocalDescription({ type: "offer", sdp: S.pendingOffer }); S.pendingOffer = null; }
+      await pc.setRemoteDescription({ type: "answer", sdp: msg });
+    } else if (type === "offer" && typeof msg === "string") {
+      await pc.setRemoteDescription({ type: "offer", sdp: msg });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      emit("user-rtc-message", { streamSlotId: S.slot, type: "answer", msg: answer.sdp });
+    } else if (type === "candidate" && msg) {
+      await pc.addIceCandidate(msg);
+    }
+  } catch (e) { sysMsg("RTC error: " + e.message); restartPeer(); }
+}
+
+function restartPeer() {
+  if (!S.wantLive) return closePeer();
+  closePeer(false);
+  S.streamState = "reconnecting"; setStatus();
+  const wait = Math.min(15000, 1000 * 2 ** S.peerRetry++);
+  // Same slot, new peer connection, like the official client's reconnect.
+  setTimeout(() => { if (S.wantLive && !S.pc && S.slot !== null) startPeer(); }, wait);
+}
+
+function closePeer(resetState = true) {
+  if (S.pc) { S.pc.close(); S.pc = null; }
+  S.pendingOffer = null;
+  if (resetState) S.streamState = "off";
+}
+
+function stopStream() {
+  S.wantLive = false;
+  emit("user-want-to-stop-stream");
+  closePeer(); S.slot = null;
+  setStatus();
+}
+
+const videoSender = () => S.pc && S.pc.getSenders().find(s => s.track && s.track.kind === "video");
+const audioSender = () => S.pc && S.pc.getSenders().find(s => s.track && s.track.kind === "audio");
+
+async function applyBitrate() {
+  const sender = videoSender(); if (!sender) return;
+  const p = sender.getParameters();
+  if (!p.encodings || !p.encodings.length) return;
+  p.encodings[0].maxBitrate = +$("quality").value;
+  try { await sender.setParameters(p); } catch {}
+}
+$("quality").value = String(store.get("quality", 1000000));
+$("quality").onchange = () => { store.set("quality", +$("quality").value); applyBitrate(); };
+
+// ---- settings sheet + live stats
+$("settingsBtn").onclick = () => { $("settingsPanel").hidden = false; renderMics(); renderLenses(); };
+$("logout").onclick = () => {
+  if (S.wantLive) stopStream();
+  send({ t: "logout" }); S.loggedIn = false;
+  if (S.ws) S.ws.close();
+  stopCamera();
+  location.reload();
+};
+let lastBytes = 0, lastTs = 0;
+setInterval(async () => {
+  if ($("settingsPanel").hidden) return;
+  const lines = [];
+  const vs = S.videoTrack ? S.videoTrack.getSettings() : {};
+  lines.push(`camera  ${S.videoTrack ? S.videoTrack.label : "-"} ${vs.width || "?"}x${vs.height || "?"} zoom ${(+currentZoom()).toFixed(2)}`);
+  lines.push(`relay   ${S.ws && S.ws.readyState === 1 ? "connected" : "down"}   stream ${S.streamState}${S.slot !== null ? " (slot " + S.slot + ")" : ""}`);
+  const sender = videoSender();
+  if (sender) {
+    const stats = await sender.getStats();
+    stats.forEach(r => {
+      if (r.type === "outbound-rtp" && r.kind === "video") {
+        const kbps = lastTs ? ((r.bytesSent - lastBytes) * 8 / (r.timestamp - lastTs)) | 0 : 0;
+        lastBytes = r.bytesSent; lastTs = r.timestamp;
+        lines.push(`sending ${kbps} kbps  ${r.frameWidth || "?"}x${r.frameHeight || "?"} @ ${r.framesPerSecond || "?"}fps  limit: ${r.qualityLimitationReason || "-"}`);
+      }
+    });
+  }
+  $("stats").textContent = lines.join("\n");
+}, 1000);
+
+window.addEventListener("pagehide", () => { if (S.wantLive) emit("user-want-to-stop-stream"); });
+
+initLogin();

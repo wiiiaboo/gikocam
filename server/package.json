@@ -1,0 +1,17 @@
+{
+  "name": "gikocam-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Signalling/chat relay between the gikocam phone page and gikopoipoi.net. Never carries video.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "socket.io-client": "4.8.3",
+    "ws": "8.18.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

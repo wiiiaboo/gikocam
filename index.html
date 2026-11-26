@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>gikocam</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- Login -->
+<section id="login">
+  <h1>gikocam</h1>
+  <label class="field">Name
+    <input id="name" maxlength="20" autocomplete="off" autocapitalize="off" placeholder="Anonymous">
+  </label>
+  <div class="field">Character
+    <div id="chars" class="chars"></div>
+  </div>
+  <label class="field">Area
+    <select id="area">
+      <option value="for">International (_for)</option>
+      <option value="gen">一般 (_gen)</option>
+    </select>
+  </label>
+  <button id="enter" class="primary">Enter</button>
+  <p id="loginError" class="error" hidden></p>
+  <details class="adv"><summary>Relay server</summary>
+    <input id="relayUrl" autocomplete="off" autocapitalize="off" spellcheck="false">
+  </details>
+</section>
+
+<!-- Camera + overlays -->
+<section id="cam" hidden>
+  <video id="preview" playsinline autoplay muted></video>
+
+  <div id="topbar">
+    <button id="roomBtn" class="pill"><span id="roomName">…</span> · <span id="userCount">0</span>👤</button>
+    <span id="status" class="pill status">offline</span>
+    <span class="spacer"></span>
+    <button id="settingsBtn" class="icon" aria-label="Settings">⚙︎</button>
+  </div>
+
+  <div id="side">
+    <button id="flip" class="icon" aria-label="Flip camera">⟲</button>
+    <button id="torch" class="icon" aria-label="Torch" hidden>🔦</button>
+    <button id="mute" class="icon" aria-label="Mute mic">🎤</button>
+  </div>
+
+  <div id="chatFeed" aria-live="polite"></div>
+
+  <div id="bottom">
+    <div id="zooms"></div>
+    <div class="row">
+      <button id="chatBtn" class="icon" aria-label="Chat">💬</button>
+      <button id="live" class="live">Go live</button>
+      <span class="icon-spacer"></span>
+    </div>
+  </div>
+
+  <!-- Expanded chat -->
+  <div id="chatPanel" hidden>
+    <div id="chatLog"></div>
+    <form id="chatForm" autocomplete="off">
+      <input id="chatInput" maxlength="500" placeholder="Say something…" enterkeyhint="send">
+      <button class="primary">Send</button>
+      <button type="button" id="chatClose" class="icon">✕</button>
+    </form>
+  </div>
+
+  <!-- Room list -->
+  <div id="roomsPanel" class="sheet" hidden>
+    <div class="sheet-head"><b>Rooms</b><button class="icon" data-close>✕</button></div>
+    <div id="roomsList"></div>
+  </div>
+
+  <!-- Settings -->
+  <div id="settingsPanel" class="sheet" hidden>
+    <div class="sheet-head"><b>Settings</b><button class="icon" data-close>✕</button></div>
+    <label class="field">Quality
+      <select id="quality">
+        <option value="500000">Low · 0.5 Mbps (~0.2 GB/h)</option>
+        <option value="1000000">Medium · 1 Mbps (~0.45 GB/h)</option>
+        <option value="2500000">High · 2.5 Mbps (~1.1 GB/h)</option>
+      </select>
+    </label>
+    <label class="field">Microphone <select id="mic"></select></label>
+    <div class="field">Fixed lens <small>(no pinch zoom; default is the auto-switching back camera)</small>
+      <div id="lenses" class="wrap"></div>
+    </div>
+    <div class="field stats" id="stats"></div>
+    <button id="logout" class="danger">Leave gikopoipoi</button>
+  </div>
+
+  <div id="toast" hidden></div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
