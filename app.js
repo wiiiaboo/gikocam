@@ -851,6 +851,7 @@ document.addEventListener("visibilitychange", () => {
 // fades from the camera to the BRB picture, and the mic is
 // muted. If the phone itself drops off, the relay shows the same picture
 // (server/brb-stream.js) until the phone is back.
+const FADE_MS = 400; // camera <-> BRB picture cross-fade
 const BRB = (() => {
   const imgs = {};
   for (const o of ["landscape", "portrait"]) { const i = new Image(); i.src = `brb/${o}.webp`; imgs[o] = i; }
@@ -892,7 +893,7 @@ const BRB = (() => {
   async function enter(reason) {
     if (S.brb) {
       if (reason === "pause") S.brb.reason = "pause";
-      if (S.brb.leaving) { S.brb.leaving = false; fade = { from: alpha, to: 1, t0: performance.now(), ms: 400 }; }
+      if (S.brb.leaving) { S.brb.leaving = false; fade = { from: alpha, to: 1, t0: performance.now(), ms: FADE_MS }; }
       return setStatus();
     }
     S.brb = { since: Date.now(), reason };
@@ -900,10 +901,10 @@ const BRB = (() => {
     const [W, H] = gikocamBrb.SIZES[orient];
     canvas = document.createElement("canvas"); canvas.width = W; canvas.height = H;
     ctx = canvas.getContext("2d");
-    alpha = 0; lastDraw = 0; fade = { from: 0, to: 1, t0: performance.now(), ms: 1000 };
+    alpha = 0; lastDraw = 0; fade = { from: 0, to: 1, t0: performance.now(), ms: FADE_MS };
     frame();
-    track = canvas.captureStream(15).getVideoTracks()[0];
-    timer = setInterval(frame, 66);
+    track = canvas.captureStream(30).getVideoTracks()[0];
+    timer = setInterval(frame, 33);
     if (S.audioTrack) S.audioTrack.enabled = false;
     const snd = videoSender();
     if (snd) await snd.replaceTrack(track).catch(() => {});
@@ -914,7 +915,7 @@ const BRB = (() => {
     const cam = S.videoTrack;
     if (!cam || cam.readyState !== "live" || cam.muted) { toast("The camera isn't back yet"); S.brb.reason = "camera"; return setStatus(); }
     S.brb.leaving = true;
-    fade = { from: alpha, to: 0, t0: performance.now(), ms: 700, then: finish };
+    fade = { from: alpha, to: 0, t0: performance.now(), ms: FADE_MS, then: finish };
   }
   async function finish() {
     if (!S.brb || !S.brb.leaving) return;
