@@ -114,9 +114,11 @@ function connectRelay() {
     const timer = setTimeout(() => { ws.close(); reject(new Error("Relay server did not answer (it may be waking up — try again in a minute)")); }, 60000);
     ws.onopen = () => { clearTimeout(timer); S.relayRetry = 0; setStatus(); resolve(); };
     ws.onerror = () => {};
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       clearTimeout(timer);
       if (S.ws !== ws) return;
+      // 4001: the access token was changed (or the cookie expired). Unlock again.
+      if (ev.code === 4001) { S.loggedIn = false; location.href = "login?expired"; return; }
       setStatus();
       if (pending) { pending.reject(new Error("Lost connection to relay")); pending = null; }
       if (S.loggedIn) scheduleRelayReconnect(); else reject(new Error("Could not reach relay server"));

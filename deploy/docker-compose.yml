@@ -10,6 +10,11 @@ services:
     environment:
       ALLOWED_ORIGINS: https://cam.gikochan.net
       GIKO_BASE_URL: https://gikopoipoi.net
+      ACCESS_TOKEN_FILE: /config/access-token
+    volumes:
+      # Lives outside ~/gikocam so deploys never touch it. Edit
+      # ~/gikocam-config/access-token on the VPS to change the token.
+      - ../../gikocam-config:/config:ro
     networks: [web]
 networks:
   web:

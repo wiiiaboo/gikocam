@@ -175,6 +175,109 @@ function originAllowed(origin) {
   return !origin || ALLOWED_ORIGINS.includes(origin);
 }
 
+// ---------------------------------------------------------------- access gate
+// The access token is a plain text file (ACCESS_TOKEN_FILE) that the owner
+// edits by hand. It is re-read every few seconds, so a new token works without
+// a restart, and changing it logs every phone out. Without ACCESS_TOKEN_FILE
+// (local development) there is no gate. With the file missing or empty the
+// gate stays shut.
+const TOKEN_FILE = process.env.ACCESS_TOKEN_FILE || null;
+const COOKIE = "gikocam_auth";
+let tokenCache = { at: 0, value: "" };
+
+async function accessToken() {
+  if (Date.now() - tokenCache.at < 5_000) return tokenCache.value;
+  let value = "";
+  try { value = (await fs.readFile(TOKEN_FILE, "utf8")).trim(); } catch {}
+  tokenCache = { at: Date.now(), value };
+  return value;
+}
+// The cookie holds a hash of the token, not the token itself.
+const cookieValue = (token) => crypto.createHash("sha256").update("gikocam:" + token).digest("hex");
+
+function sameText(a, b) {
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+async function isAuthed(req) {
+  if (!TOKEN_FILE) return true;
+  const token = await accessToken();
+  if (!token) return false;
+  const m = (req.headers.cookie || "").match(new RegExp(`(?:^|;\\s*)${COOKIE}=([a-f0-9]{64})`));
+  return !!m && sameText(m[1], cookieValue(token));
+}
+
+// Slow down password guessing: 10 wrong tries per address per 15 minutes.
+const failures = new Map();
+const clientIp = (req) => String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+function tooManyFailures(ip) {
+  const f = failures.get(ip);
+  if (f && Date.now() > f.until) { failures.delete(ip); return false; }
+  return !!f && f.count >= 10;
+}
+function noteFailure(ip) {
+  const f = failures.get(ip) || { count: 0, until: Date.now() + 15 * 60_000 };
+  f.count += 1; failures.set(ip, f);
+}
+
+function readBody(req, limit = 2048) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (c) => { body += c; if (body.length > limit) { reject(new Error("too large")); req.destroy(); } });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+function loginPage(message) {
+  const note = message ? `<p class="err">${message}</p>` : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000"><title>gikocam</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#000;color:#f2f2f2;font:15px/1.35 -apple-system,system-ui,sans-serif}
+main{max-width:420px;margin:0 auto;padding:calc(28vh + env(safe-area-inset-top)) 20px 20px}
+h1{margin:0 0 18px;font-weight:700}
+input[hidden]{display:none}input{display:block;width:100%;padding:12px 13px;margin:0 0 12px;background:#16161a;border:1px solid #333;border-radius:10px;color:#fff;font-size:16px}
+button{width:100%;padding:12px;border:0;border-radius:10px;background:#4fc3f7;color:#000;font:600 17px -apple-system,system-ui,sans-serif}
+.err{color:#ff8a80;margin:0 0 12px}
+</style></head><body><main>
+<h1>gikocam</h1>${note}
+<form method="post" action="/login">
+<input type="text" name="username" value="gikocam" autocomplete="username" hidden>
+<input type="password" name="token" placeholder="Access token" autocomplete="current-password" autofocus required>
+<button>Unlock</button>
+</form></main></body></html>`;
+}
+
+async function handleLogin(req, res, url) {
+  const html = (status, message) => {
+    res.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    res.end(loginPage(message));
+  };
+  if (req.method === "GET") return html(200, url.searchParams.has("expired") ? "Please unlock again." : "");
+  const ip = clientIp(req);
+  if (tooManyFailures(ip)) return html(429, "Too many wrong tries. Wait 15 minutes.");
+  const token = await accessToken();
+  if (!token) return html(503, "No access token is set on the server yet.");
+  const given = (new URLSearchParams(await readBody(req)).get("token") || "").trim();
+  if (!sameText(cookieValue(given), cookieValue(token))) {
+    noteFailure(ip);
+    log("login_failed", { ip });
+    await new Promise((r) => setTimeout(r, 800));
+    return html(401, "Wrong access token.");
+  }
+  failures.delete(ip);
+  const secure = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+  res.writeHead(303, {
+    location: "/",
+    "set-cookie": `${COOKIE}=${cookieValue(token)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`,
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   if (origin && originAllowed(origin)) {
@@ -186,6 +289,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify({ ok: true, sessions: sessions.size }));
+    }
+    if (TOKEN_FILE) {
+      if (url.pathname === "/login") return await handleLogin(req, res, url);
+      if (url.pathname === "/logout") {
+        res.writeHead(303, { location: "/login", "set-cookie": `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax` });
+        return res.end();
+      }
+      if (!(await isAuthed(req))) {
+        const isPage = req.method === "GET" && (url.pathname.endsWith("/") || url.pathname.endsWith(".html"));
+        if (isPage) { res.writeHead(303, { location: "/login", "cache-control": "no-store" }); return res.end(); }
+        res.writeHead(401, { "content-type": "text/plain" });
+        return res.end("locked");
+      }
     }
     if (url.pathname === "/characters") {
       const catalog = await gikoJson("/api/characters/regular");
@@ -208,6 +324,10 @@ wss.on("connection", (ws, req) => {
     log("origin_rejected", { origin: req.headers.origin });
     return ws.close(4003, "origin not allowed");
   }
+  // The page can't load without the cookie, but check it here too so the
+  // relay itself isn't usable without the access token.
+  const authed = isAuthed(req);
+  authed.then((ok) => { if (!ok) ws.close(4001, "locked"); });
   let session = null;
   const reply = (msg) => ws.readyState === 1 && ws.send(JSON.stringify(msg));
 
@@ -215,6 +335,7 @@ wss.on("connection", (ws, req) => {
   ws.on("pong", () => { ws.isAlive = true; });
 
   ws.on("message", async (raw) => {
+    if (!(await authed)) return;
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return reply({ t: "error", message: "bad json" }); }
     try {

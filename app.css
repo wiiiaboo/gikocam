@@ -111,6 +111,7 @@ button { cursor: pointer; }
 .wrap button { background: #222; border: 1px solid #444; border-radius: 999px; padding: 7px 11px; font-size: 13px; }
 .wrap button.sel { background: var(--accent); color: #000; border-color: var(--accent); }
 .stats { font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; color: #9a9a9a; }
+.lock { display: block; text-align: center; margin-top: 14px; color: #999; font-size: 13px; }
 .danger { width: 100%; padding: 12px; border-radius: 10px; background: #3a1414; border: 1px solid #6b2020; color: #ff8a80; }
 #roomsList button { display: flex; width: 100%; justify-content: space-between; gap: 8px; padding: 11px 12px; margin-bottom: 6px;
   background: #1c1c20; border: 1px solid #333; border-radius: 10px; text-align: left; }
