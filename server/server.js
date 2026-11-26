@@ -71,9 +71,28 @@ const ALLOWED_EMITS = new Set([
 const log = (event, details = {}) =>
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...details }));
 
+// gikopoipoi only lists rooms for a logged-in user, so the login screen gets
+// the list from a live session in that area, or the last one any session saw.
+const roomCache = new Map(); // areaId -> {at, rooms}
+async function roomsForArea(areaId) {
+  const live = [...sessions.values()].find((s) => s.areaId === areaId && s.privateUserId);
+  if (live) {
+    const cached = roomCache.get(areaId);
+    if (!cached || Date.now() - cached.at > 30_000) await live.rooms().catch(() => {});
+  }
+  const c = roomCache.get(areaId);
+  return { at: c?.at || null, rooms: (c?.rooms || []).map((r) => ({
+    id: r.id, userCount: r.userCount || 0, streams: Array.isArray(r.streams) ? r.streams.length : 0,
+  })) };
+}
+
 async function gikoJson(path, init = {}) {
   const res = await fetch(GIKO + path, { ...init, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} from ${path}`);
+  if (!res.ok) {
+    // gikopoipoi puts the reason in the body, e.g. {"error":"ip_restricted"}.
+    const reason = await res.json().then((b) => b && b.error).catch(() => null);
+    throw new Error(`${res.status}${reason ? " " + reason : ""} from ${path}`);
+  }
   return res.json();
 }
 
@@ -115,6 +134,7 @@ class Session {
       `/api/areas/${encodeURIComponent(this.areaId)}/rooms/${encodeURIComponent(String(roomId || "admin_st"))}`,
       { headers: { authorization: `Bearer ${this.privateUserId}` } });
     this.connectSocket();
+    this.rooms().catch(() => {}); // refresh the login screen's room list
   }
 
   connectSocket() {
@@ -137,8 +157,10 @@ class Session {
   }
 
   async rooms() {
-    return gikoJson(`/api/areas/${encodeURIComponent(this.areaId)}/rooms`,
+    const rooms = await gikoJson(`/api/areas/${encodeURIComponent(this.areaId)}/rooms`,
       { headers: { authorization: `Bearer ${this.privateUserId}` } });
+    if (Array.isArray(rooms)) roomCache.set(this.areaId, { at: Date.now(), rooms });
+    return rooms;
   }
 
   attach(ws) {
@@ -307,6 +329,11 @@ const server = http.createServer(async (req, res) => {
       const catalog = await gikoJson("/api/characters/regular");
       res.writeHead(200, { "content-type": "application/json", "cache-control": "max-age=3600" });
       return res.end(JSON.stringify(Object.keys(catalog)));
+    }
+    if (url.pathname === "/rooms") {
+      const area = String(url.searchParams.get("area") || "for").slice(0, 20);
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(JSON.stringify(await roomsForArea(area)));
     }
     if (req.method === "GET" && await serveStatic(url.pathname, res)) return;
     res.writeHead(404, { "content-type": "text/plain" });

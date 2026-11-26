@@ -56,6 +56,7 @@ async function initLogin() {
   $("name").value = store.get("name", "");
   $("area").value = store.get("area", "for");
   $("relayUrl").value = S.relayUrl;
+  loadLoginRooms();
   let chars = FALLBACK_CHARS;
   try {
     const r = await fetch(S.relayUrl.replace(/^ws/, "http").replace(/\/ws$/, "/characters"));
@@ -78,6 +79,29 @@ async function initLogin() {
   if (!box.querySelector(".sel") && box.firstChild) box.firstChild.classList.add("sel");
 }
 
+// Room picker: the last room used in this area is preselected.
+$("area").onchange = () => loadLoginRooms();
+async function loadLoginRooms() {
+  const areaId = $("area").value, sel = $("room");
+  const last = store.get("room:" + areaId, "admin_st");
+  const fill = (rooms) => {
+    sel.innerHTML = "";
+    const add = (id, label) => { const o = document.createElement("option"); o.value = id; o.textContent = label; sel.appendChild(o); };
+    const byId = new Map(rooms.map(r => [r.id, r]));
+    const label = (r) => r.id + (r.userCount ? ` · ${r.userCount}👤` : "") + (r.streams ? ` · ${r.streams} streaming` : "");
+    add(last, byId.has(last) ? label(byId.get(last)) + " (last)" : last + " (last)");
+    for (const r of [...rooms].sort((a, b) => b.userCount - a.userCount || a.id.localeCompare(b.id)))
+      if (r.id !== last) add(r.id, label(r));
+    if (!byId.has("admin_st") && last !== "admin_st") add("admin_st", "admin_st");
+    sel.value = last;
+  };
+  fill([]);
+  try {
+    const r = await fetch(S.relayUrl.replace(/^ws/, "http").replace(/\/ws$/, "/rooms") + "?area=" + encodeURIComponent(areaId));
+    if (r.ok && $("area").value === areaId) fill((await r.json()).rooms || []);
+  } catch {}
+}
+
 $("enter").onclick = async () => {
   const err = $("loginError"); err.hidden = true;
   const name = $("name").value.trim();
@@ -92,9 +116,11 @@ $("enter").onclick = async () => {
     await startCamera();            // inside the tap, so iOS allows camera + mic
     $("enter").textContent = "Connecting…";
     await connectRelay();
-    const res = await request({ t: "login", name, characterId, areaId, roomId: store.get("room:" + areaId, "admin_st") }, ["login-ok"])
-      .catch(e => { throw new Error(/\/api\/login/.test(e.message)
-        ? "gikopoipoi refused the login (" + e.message.split(" ")[0] + "). Wait a minute and try again." : e.message); });
+    const res = await request({ t: "login", name, characterId, areaId, roomId: $("room").value || "admin_st" }, ["login-ok"])
+      .catch(e => { throw new Error(/ip_restricted/.test(e.message)
+        ? "gikopoipoi refused the login: this network's IP is restricted (ip_restricted)."
+        : /\/api\/login/.test(e.message)
+        ? "gikopoipoi refused the login (" + e.message.replace(/ from .*/, "") + "). Wait a minute and try again." : e.message); });
     onLoggedIn(res);
     $("login").hidden = true; $("cam").hidden = false;
     acquireWakeLock();
