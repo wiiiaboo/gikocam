@@ -29,7 +29,7 @@ import { io } from "socket.io-client";
 const PORT = Number(process.env.PORT || 8080);
 const GIKO = (process.env.GIKO_BASE_URL || "https://gikopoipoi.net").replace(/\/$/, "");
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  "https://wiiiaboo.github.io,http://localhost:8123,http://127.0.0.1:8123")
+  "http://localhost:8123,http://127.0.0.1:8123")   // production sets this in deploy/docker-compose.yml
   .split(",").map(s => s.trim()).filter(Boolean);
 const RESUME_GRACE_MS = Number(process.env.RESUME_GRACE_MS || 90_000);
 const MAX_MISSED_EVENTS = 300;
